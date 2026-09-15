@@ -35,8 +35,10 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          gh codespace cp -c "$OLD_CS" "remote:/home/codespace/hermes-backup/migration-critical-1789516065.tar.gz" /tmp/mc.tar.gz
-          gh codespace cp -c "$OLD_CS" "remote:/home/codespace/hermes-backup/migration-state-1789516065.tar.gz" /tmp/ms.tar.gz
+          gh codespace ssh --codespace "$OLD_CS" --config > /tmp/cfg_old
+          HOSTO=$(awk '/^Host /{print $2; exit}' /tmp/cfg_old)
+          scp -F /tmp/cfg_old -o StrictHostKeyChecking=accept-new "$HOSTO:/home/codespace/hermes-backup/migration-critical-1789516065.tar.gz" /tmp/mc.tar.gz
+          scp -F /tmp/cfg_old -o StrictHostKeyChecking=accept-new "$HOSTO:/home/codespace/hermes-backup/migration-state-1789516065.tar.gz" /tmp/ms.tar.gz
           echo "runner copies:"
           ls -la /tmp/mc.tar.gz /tmp/ms.tar.gz | awk '{print $NF, $5"B"}'
           echo "critical sha256: $(sha256sum /tmp/mc.tar.gz | cut -c1-32)… (expect 58daef54d7dfe8d1e9cb54e3fbf09c5c…)"
@@ -59,8 +61,10 @@ jobs:
           ORIG=$(cat /tmp/origin.txt)
           echo "origin url: $ORIG"
           umask 077
-          gh codespace cp -c "$NEW_CS" /tmp/mc.tar.gz remote:/tmp/mc.tar.gz
-          gh codespace cp -c "$NEW_CS" /tmp/ms.tar.gz remote:/tmp/ms.tar.gz
+          gh codespace ssh --codespace "$NEW_CS" --config > /tmp/cfg_new
+          HOSTN=$(awk '/^Host /{print $2; exit}' /tmp/cfg_new)
+          scp -F /tmp/cfg_new -o StrictHostKeyChecking=accept-new /tmp/mc.tar.gz "$HOSTN:/tmp/mc.tar.gz"
+          scp -F /tmp/cfg_new -o StrictHostKeyChecking=accept-new /tmp/ms.tar.gz "$HOSTN:/tmp/ms.tar.gz"
           gh codespace ssh --codespace "$NEW_CS" -- ORIGIN="$ORIG" bash -s <<'REMOTE' 2>&1 | python3 -c '
           import sys,re
           d=sys.stdin.buffer.read().decode("utf-8","replace")
