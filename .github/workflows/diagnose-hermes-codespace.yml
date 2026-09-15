@@ -36,7 +36,7 @@ jobs:
           d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redacted>",d)
           sys.stdout.write(d)'
           set -euo pipefail
-          T="$TARP"
+          T="/home/codespace/hermes-backup/hermes-migration-20260915233438.tar.gz"
           [ -s "$T" ] || { echo "TARBALL MISSING"; exit 1; }
           echo "tarball re-verify sha256: $(sha256sum "$T" | cut -d' ' -f1)"
           echo "entries: $(tar -tzf "$T" | wc -l)"
