@@ -1,9 +1,8 @@
 name: Diagnose Hermes Codespace (read-only)
 
-# DIAGNOSTIC-ONLY. Phase 2: read gateway-exit-diag.log,
-# gateway-shutdown-diag.log (redacted) and /proc/uptime from inside the
-# existing Codespace. Zero installs/restarts/modifications.
-# The credential is used only via the Actions secret reference and never printed.
+# DIAGNOSTIC-ONLY. Phase 3: provider-only audit inside the existing
+# Codespace. Zero installs/restarts/config changes. No .env values are
+# ever read; only key names, presence flags, sanitized hosts.
 
 on:
   workflow_dispatch:
@@ -19,7 +18,7 @@ env:
 
 jobs:
   diagnose:
-    name: SSH + exit-diag logs + uptime (read-only)
+    name: Provider audit (read-only, sanitized)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -58,7 +57,7 @@ jobs:
             echo "ssh=skipped-stopped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if out=$(gh codespace ssh --codespace "$CODESPACE_NAME" -- sh -c 'echo SSH_OK; hostname; whoami' 2>ssh_err.txt); then
+          if out=$(gh codespace ssh --codespace "$CODESPACE_NAME" -- sh -c 'echo SSH_OK; hostname' 2>ssh_err.txt); then
             echo "$out"
             echo "ssh=ok" >> "$GITHUB_OUTPUT"
           else
@@ -68,46 +67,111 @@ jobs:
           fi
           rm -f ssh_err.txt
 
-      - name: Read exit-diag logs + uptime INSIDE the Codespace (redacted)
+      - name: Provider audit INSIDE the Codespace (sanitized, read-only)
         if: steps.sshcheck.outputs.ssh == 'ok'
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
           gh codespace ssh --codespace "$CODESPACE_NAME" -- bash -s <<'REMOTE'
           set +e
-          redact() {
-            sed -E \
-              -e 's/[0-9]{8,10}:[A-Za-z0-9_-]{30,}/<TG_TOKEN_REDACTED>/g' \
-              -e 's/(github_pat_|ghp_)[A-Za-z0-9_]+/<GH_TOKEN_REDACTED>/g' \
-              -e 's/sk-[A-Za-z0-9_-]{20,}/<API_KEY_REDACTED>/g' \
-              -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1<REDACTED>/g' \
-              -e 's/eyJ[A-Za-z0-9._-]{20,}/<JWT_REDACTED>/g'
-          }
 
-          echo "### SECTION: proc-uptime"
-          now_epoch=$(date +%s)
-          up_s=$(cut -d. -f1 /proc/uptime)
-          echo "now_utc: $(date -u +'%Y-%m-%d %H:%M:%S')"
-          echo "uptime_seconds: $up_s"
-          boot_epoch=$((now_epoch - up_s))
-          echo "computed_boot_utc: $(date -u -d "@$boot_epoch" +'%Y-%m-%d %H:%M:%S')"
+          echo "### PHASE1: runtime"
+          HBIN="$HOME/.local/bin/hermes"
+          [ -x "$HBIN" ] || HBIN="$(command -v hermes)"
+          echo "binary: ${HBIN:-NOT FOUND}"
+          echo "interpreter: $(head -1 "$HBIN" 2>/dev/null)"
+          "$HBIN" --version 2>&1 | head -6
+          python3 --version
+          pgrep -af hermes >/dev/null 2>&1 && echo "hermes process: RUNNING" || echo "hermes process: NOT RUNNING"
+          pgrep -afi telegram >/dev/null 2>&1 && echo "telegram gateway: RUNNING" || echo "telegram gateway: NOT RUNNING"
 
-          echo "### SECTION: gateway-exit-diag.log (redacted, relevant tail)"
-          f="$HOME/.hermes/logs/gateway-exit-diag.log"
-          if [ -f "$f" ]; then
-            echo "path: $f | mtime: $(stat -c %y "$f") | size: $(stat -c %s "$f") bytes"
-            redact < "$f" | tail -n 50
-          else
-            echo "NOT FOUND at $f"
-          fi
+          echo "### PHASE2: config.yaml (sanitized parse)"
+          python3 - <<'PYCFG'
+          import yaml, json, re, os
+          from urllib.parse import urlparse
+          SECRET = re.compile(r'(api[_-]?key|token|secret|passw|jwt|credential|private)', re.I)
+          def host_only(u):
+              try:
+                  p = urlparse(str(u))
+                  return (p.scheme + "://" + p.hostname + (":" + str(p.port) if p.port else "") + " [path/query redacted]") if p.hostname else "<non-url>"
+              except Exception:
+                  return "<unparseable>"
+          def emit(kp, v):
+              if SECRET.search(kp):
+                  print(f"  {kp}: {'PRESENT (redacted)' if v not in (None, '') else 'EMPTY/NONE'}")
+              elif isinstance(v, str):
+                  s = v.strip()
+                  if s.startswith("http"):
+                      print(f"  {kp}: {host_only(s)}")
+                  elif len(s) > 40:
+                      print(f"  {kp}: <string:{len(s)} chars>")
+                  else:
+                      print(f"  {kp}: {s}")
+              else:
+                  print(f"  {kp}: {v}")
+          def walk(o, p=""):
+              if isinstance(o, dict):
+                  for k, v in o.items():
+                      kp = f"{p}.{k}" if p else str(k)
+                      if isinstance(v, (dict, list)):
+                          if SECRET.search(kp):
+                              print(f"  {kp}: <group redacted>")
+                          else:
+                              walk(v, kp)
+                      else:
+                          emit(kp, v)
+              elif isinstance(o, list):
+                  print(f"  {p}: list[{len(o)}] -> " + ", ".join(str(i)[:30] if not isinstance(i,(dict,list)) else "<obj>" for i in o[:10]))
+          cfg_path = os.path.expanduser("~/.hermes/config.yaml")
+          try:
+              cfg = yaml.safe_load(open(cfg_path))
+              print("  config.yaml: parsed OK")
+              walk(cfg)
+          except Exception as e:
+              print(f"  config.yaml: ERROR: {e}")
 
-          echo "### SECTION: gateway-shutdown-diag.log (redacted, relevant tail)"
-          f="$HOME/.hermes/logs/gateway-shutdown-diag.log"
-          if [ -f "$f" ]; then
-            echo "path: $f | mtime: $(stat -c %y "$f") | size: $(stat -c %s "$f") bytes"
-            redact < "$f" | tail -n 50
-          else
-            echo "NOT FOUND at $f"
-          fi
-          echo "### END"
+          print("### PHASE2b: .env key names only (values never read)")
+          envp = os.path.expanduser("~/.hermes/.env")
+          try:
+              names = []
+              for line in open(envp):
+                  m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=", line)
+                  if m:
+                      names.append(m.group(1))
+              for n in sorted(set(names)):
+                  print(f"  ENV KEY: {n}")
+              for probe in ["TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL", "NOUS_API_KEY", "COPILOT_API_KEY", "GITHUB_TOKEN"]:
+                  print(f"  PRESENCE {probe}: {'present' if probe in names else 'absent'}")
+          except FileNotFoundError:
+              print("  .env: MISSING")
+
+          print("### PHASE2c: auth.json structure (keys + types only)")
+          try:
+              d = json.load(open(os.path.expanduser("~/.hermes/auth.json")))
+              def awalk(o, p=""):
+                  if isinstance(o, dict):
+                      for k, v in o.items():
+                          kp = f"{p}.{k}" if p else str(k)
+                          if SECRET.search(kp):
+                              print(f"  {kp}: {'PRESENT (redacted)' if v not in (None,'') else 'EMPTY/NONE'}")
+                          elif isinstance(v, (dict, list)):
+                              awalk(v, kp)
+                          elif isinstance(v, str) and v.startswith("http"):
+                              print(f"  {kp}: {host_only(v)}")
+                          elif isinstance(v, str) and len(v) > 40:
+                              print(f"  {kp}: <string:{len(v)} chars>")
+                          else:
+                              print(f"  {kp}: {v}")
+                  elif isinstance(o, list):
+                      print(f"  {p}: list[{len(o)}]")
+              awalk(d)
+          except Exception as e:
+              print(f"  auth.json: {e}")
+
+          echo "### PHASE4: installed provider registry + local help"
+          find "$HOME/.hermes/hermes-agent" -name "*.py" -ipath "*provider*" 2>/dev/null | sed "s|$HOME/.hermes/hermes-agent/||" | head -15
+          "$HBIN" model --help 2>&1 | head -40
+          echo "--- setup help (portal option check) ---"
+          "$HBIN" setup --help 2>&1 | head -20
+          echo "### END AUDIT"
           REMOTE
