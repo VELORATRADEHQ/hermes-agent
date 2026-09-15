@@ -1,28 +1,37 @@
-name: lifecycle-sentinel-read
+name: hardening-audit
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
+
+env:
+  CODESPACE_NAME: crispy-space-cod-jrqqwq797j6vcwqw
 
 jobs:
-  sentinel:
-    name: READ-ONLY lifecycle sentinel read
+  audit:
+    name: Phase-1 hardening audit (READ-ONLY)
     runs-on: ubuntu-latest
-    env:
-      CODESPACE_NAME: crispy-space-cod-jrqqwq797j6vcwqw
+    timeout-minutes: 8
     steps:
-      - name: State gate
+      - name: Secret presence (never printed)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
-          set -euo pipefail
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
-          state=$(gh api "/user/codespaces/${CODESPACE_NAME}" --jq .state)
-          echo "codespace state: $state"
-          [ "$state" = "Available" ] || { echo "::error::Not Available"; exit 1; }
+          echo "GH_TOKEN present"
 
-      - name: Read lifecycle sentinel + module (read-only)
+      - name: Runner-side gh capability probe (read-only --help)
+        run: |
+          echo "--- gh codespace edit --help ---"
+          gh codespace edit --help 2>&1 | head -40 || echo "no edit subcommand"
+
+      - name: Codespace state + settings (read-only)
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+        run: |
+          gh api "/user/codespaces/${CODESPACE_NAME}" --jq '{state,idle_timeout_minutes,machine:.machine.name,location,updated_at}'
+
+      - name: In-codespace audit (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
@@ -32,30 +41,30 @@ jobs:
           d=sys.stdin.buffer.read().decode("utf-8","replace")
           d=re.sub(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}","<tg-token>",d)
           d=re.sub(r"(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}","<redacted>",d)
-          d=re.sub(r"chat_id[\" ]*[:=][\" ]*[0-9]{5,}","chat_id=<id>",d)
+          d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redacted>",d)
           sys.stdout.write(d)'
           set -uo pipefail
-          H="$HOME/.hermes"; SRC="$H/hermes-agent"
-
-          echo "===== S1) sentinel path from installed source ====="
-          sed -n '980,1010p' "$SRC/hermes_cli/gateway_windows.py" 2>/dev/null | cut -c1-190 | grep -nE "sentinel|path|json|return" | head -12
-          grep -rn "get_lifecycle_sentinel_path\|SENTINEL" "$SRC/gateway/" 2>/dev/null | head -10 | sed "s|$SRC|<src>|" | cut -c1-170
-
-          echo "===== S2) locate sentinel file on disk ====="
-          find "$H" -maxdepth 3 \( -iname "*sentinel*" -o -iname "*lifecycle*" -o -iname "*ledger*" \) 2>/dev/null | head -10 | sed "s|$HOME|~|"
-
-          echo "===== S3) dump sentinel/ledger content (sanitized) ====="
-          for f in $(find "$H" -maxdepth 3 \( -iname "*sentinel*" -o -iname "*lifecycle*" \) -type f 2>/dev/null | head -4); do
-            echo "--- ${f/#$HOME/~} ($(wc -c < "$f") bytes) ---"
-            head -c 1500 "$f" | cut -c1-200 | head -30
-            echo
-          done
-
-          echo "===== S4) read_prior_exit_label semantics ====="
-          grep -n -B3 -A25 "def read_prior_exit_label" "$SRC/gateway/lifecycle_ledger.py" 2>/dev/null | head -45 | cut -c1-190
-
-          echo "===== S5) what kills a gateway life per ledger (classifications) ====="
-          grep -nE "UNCLEAN|SIGKILL|OOM|VM death|clean|exit_path" "$SRC/gateway/lifecycle_ledger.py" 2>/dev/null | head -12 | cut -c1-190
-
-          echo "SENTINEL_DONE"
+          H="$HOME/.hermes"
+          export PATH="$H/bin:$PATH"
+          echo "===== H1) hermes process check ====="
+          pgrep -af "hermes" | grep -vi pgrep | head -5 | cut -c1-120 || echo "no hermes process running"
+          echo "===== H2) gateway state dir ====="
+          ls -la "$H/state" 2>/dev/null | head -10 || echo "state dir missing"
+          echo "sentinel: $(cat "$H/state/gateway.lifecycle.json" 2>/dev/null || echo absent)"
+          echo "===== H3) effective config (redacted) ====="
+          echo "model.provider = $(hermes config get model.provider 2>/dev/null)"
+          echo "model.default  = $(hermes config get model.default 2>/dev/null)"
+          echo "GEMINI_API_KEY: $(awk -F= '$1=="GEMINI_API_KEY"{print (length($2)>5)?"PRESENT":"EMPTY"}' "$H/.env" 2>/dev/null)"
+          echo "TELEGRAM_BOT_TOKEN: $(awk -F= '$1=="TELEGRAM_BOT_TOKEN"{print (length($2)>20)?"PRESENT":"EMPTY"}' "$H/.env" 2>/dev/null)"
+          echo "===== H4) supervisors ====="
+          (systemctl --user list-units 2>/dev/null | grep -i hermes | head -3) || echo "no user systemd hermes units"
+          command -v tmux >/dev/null && echo "tmux EXISTS" || echo "no tmux"
+          command -v crontab >/dev/null && crontab -l 2>/dev/null | grep -v '^#' | head -3 || echo "no crontab"
+          echo "===== H5) repo working tree ====="
+          git -C /workspaces/hermes-agent- rev-parse --abbrev-ref HEAD 2>/dev/null
+          git -C /workspaces/hermes-agent- status --porcelain 2>/dev/null | head -10 | cut -c1-100
+          echo "porcelain lines: $(git -C /workspaces/hermes-agent- status --porcelain 2>/dev/null | wc -l)"
+          echo "===== H6) hermes version ====="
+          hermes --version 2>&1 | head -1
+          echo "AUDIT_DONE"
           REMOTE
