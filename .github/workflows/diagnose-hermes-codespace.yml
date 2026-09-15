@@ -167,6 +167,7 @@ jobs:
               awalk(d)
           except Exception as e:
               print(f"  auth.json: {e}")
+          PYCFG
 
           echo "### PHASE4: installed provider registry + local help"
           find "$HOME/.hermes/hermes-agent" -name "*.py" -ipath "*provider*" 2>/dev/null | sed "s|$HOME/.hermes/hermes-agent/||" | head -15
