@@ -1,4 +1,4 @@
-name: apply-gemini-provider
+name: telegram-phase1-audit
 on:
   workflow_dispatch:
 
@@ -6,64 +6,31 @@ permissions:
   contents: read
 
 jobs:
-  apply:
-    name: Apply Gemini provider (authorized, secret-gated)
+  audit:
+    name: Telegram Phase-1 READ-ONLY audit
     runs-on: ubuntu-latest
     env:
       CODESPACE_NAME: crispy-space-cod-jrqqwq797j6vcwqw
     steps:
-      - name: Preconditions + stage key on runner
-        env:
-          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          set -euo pipefail
-          [ -n "${GH_TOKEN:-}" ] || { echo "::error::CODESPACE_LIFECYCLE_PAT missing"; exit 1; }
-          if [ -z "${GEMINI_API_KEY:-}" ]; then
-            echo "::error::GEMINI_API_KEY missing — create repo Actions secret named GEMINI_API_KEY (value: regenerated Gemini key)"
-            exit 1
-          fi
-          umask 077
-          printf '%s' "$GEMINI_API_KEY" > /tmp/gkey
-          echo "key staged on runner (bytes: $(wc -c < /tmp/gkey)); value never printed; GitHub auto-masks secrets in logs"
-
-      - name: Codespace state gate (NO lifecycle changes)
+      - name: Preconditions + state gate (no lifecycle action)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
           set -euo pipefail
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
           state=$(gh api "/user/codespaces/${CODESPACE_NAME}" --jq .state)
           echo "codespace state: $state"
           [ "$state" = "Available" ] || { echo "::error::Not Available; NO start performed (policy)"; exit 1; }
 
-      - name: Transfer key into codespace (ephemeral tmp, 600)
+      - name: Read-only Telegram audit inside codespace
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-        run: |
-          set -euo pipefail
-          if gh codespace cp -c "$CODESPACE_NAME" /tmp/gkey remote:/tmp/gk_tmp 2>/tmp/cp.err; then
-            echo "transfer ok (gh codespace cp)"
-          else
-            echo "cp failed; fallback via ssh --config + scp"
-            sed -E 's/[A-Za-z0-9._\/-]{30,}/<redacted>/g' /tmp/cp.err | head -5
-            gh codespace ssh --codespace "$CODESPACE_NAME" --config > /tmp/sshcfg
-            hostalias=$(awk '/^Host /{print $2; exit}' /tmp/sshcfg)
-            scp -F /tmp/sshcfg -o StrictHostKeyChecking=accept-new /tmp/gkey "${hostalias}:/tmp/gk_tmp"
-            shred -u /tmp/sshcfg /tmp/cp.err 2>/dev/null || true
-            echo "transfer ok (scp fallback)"
-          fi
-
-      - name: Verify + discover + backup + apply + validate + real request
-        env:
-          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -uo pipefail
           gh codespace ssh --codespace "$CODESPACE_NAME" -- bash -s <<'REMOTE' 2>&1 | python3 -c '
-          import sys,os,re
+          import sys,re
           d=sys.stdin.buffer.read().decode("utf-8","replace")
-          k=os.environ.get("GEMINI_API_KEY","")
-          if k: d=d.replace(k,"<KEY>")
+          d=re.sub(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}","<tg-token>",d)
           d=re.sub(r"(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}","<redacted>",d)
           d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redacted>",d)
           sys.stdout.write(d)'
@@ -71,174 +38,104 @@ jobs:
           H="$HOME/.hermes"; SRC="$H/hermes-agent"
           export PATH="$H/bin:$PATH"
 
-          echo "===== 0) context ====="
-          if ! command -v hermes >/dev/null 2>&1; then
-            echo "RESULT=NOT_READY reason=hermes_not_found"; shred -u /tmp/gk_tmp; exit 1
-          fi
-          hermes --version 2>&1 | head -2
-          if [ ! -s /tmp/gk_tmp ]; then
-            echo "RESULT=NOT_READY reason=key_transfer_missing"; exit 1
-          fi
-          echo "staged key: PRESENT ($(wc -c < /tmp/gk_tmp) bytes)"
-          K=$(cat /tmp/gk_tmp)
+          echo "===== T1) .env telegram surface (KEY NAMES + flags only) ====="
+          if [ -f "$H/.env" ]; then
+            echo ".env exists ($(wc -c < "$H/.env") bytes)"
+            awk -F= '/^(TELEGRAM|TG_|BOT_)/{print "key:", $1}' "$H/.env"
+            if grep -q '^TELEGRAM_BOT_TOKEN=.\{20,\}' "$H/.env"; then echo "TELEGRAM_BOT_TOKEN: PRESENT (length-ok, value never read into output)"
+            elif grep -q '^TELEGRAM_BOT_TOKEN=' "$H/.env"; then echo "TELEGRAM_BOT_TOKEN: PRESENT-BUT-SHORT (suspicious)"
+            else echo "TELEGRAM_BOT_TOKEN: MISSING"; fi
+            for v in TELEGRAM_ALLOWED_USERS TELEGRAM_ADMIN_IDS ALLOWED_USERS TG_ALLOWED_USERS; do
+              if grep -q "^$v=..*" "$H/.env"; then echo "$v: PRESENT"; else echo "$v: absent"; fi
+            done
+            echo "GEMINI_API_KEY flag: $(awk -F= '$1=="GEMINI_API_KEY"{print (length($2)>5)?"PRESENT":"EMPTY"}' "$H/.env")"
+          else
+            echo ".env MISSING"; fi
 
-          echo "===== 1) verify regenerated key + exact model (from codespace network) ====="
-          code=$(curl -s -o /tmp/gm.json -w "%{http_code}" --max-time 30 \
-            -H "x-goog-api-key: $K" "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100")
-          echo "GET v1beta/models -> HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "RESULT=NOT_READY reason=key_invalid_from_codespace http=$code"
-            python3 -c "import json;print(str(json.load(open('/tmp/gm.json')).get('error',{}))[:250])" 2>/dev/null
-            shred -u /tmp/gk_tmp /tmp/gm.json 2>/dev/null; exit 1
-          fi
+          echo "===== T2) config.yaml telegram/gateway keys (structure only; values classified) ====="
           python3 - <<'PY'
-          import json,sys
-          ids=[m["name"].split("/",1)[1] for m in json.load(open("/tmp/gm.json"))["models"]]
-          print("catalog size:", len(ids))
-          ok = "gemini-3-flash-preview" in ids
-          print("exact gemini-3-flash-preview present:", ok)
-          sys.exit(0 if ok else 1)
+          import yaml,sys
+          try:
+              d=yaml.safe_load(open("/home/codespace/.hermes/config.yaml"))
+          except Exception as e:
+              print("config.yaml load error:", e); sys.exit(0)
+          def walk(node, path=""):
+              if isinstance(node, dict):
+                  for k,v in node.items(): walk(v, f"{path}{k}.")
+              else:
+                  p=path[:-1]
+                  if p.split(".")[0] in ("telegram","gateway","messaging"):
+                      if isinstance(node,bool) or node in (None,""):
+                          print(f"  {p} = {node}")
+                      elif isinstance(node,(int,float)):
+                          print(f"  {p} = <number>")
+                      elif isinstance(node,list):
+                          print(f"  {p} = <list:{len(node)} items>")
+                      else:
+                          s=str(node)
+                          print(f"  {p} = <string:{len(s)} chars>")
+          walk(d)
+          keys=list(d.keys()) if isinstance(d,dict) else []
+          print("  top-level keys:", keys)
           PY
-          if [ $? -ne 0 ]; then
-            echo "RESULT=NOT_READY reason=model_not_in_catalog"; shred -u /tmp/gk_tmp /tmp/gm.json 2>/dev/null; exit 1
-          fi
-          rm -f /tmp/gm.json
 
-          echo "===== 2) discovery: hermes v0.21.3 google/openai-compat surface ====="
-          grep -rn "GEMINI_API_KEY" "$SRC/hermes_cli" 2>/dev/null | head -3 | sed "s|$SRC|<src>|" | cut -c1-170
-          grep -rn "GOOGLE_API_KEY" "$SRC/hermes_cli" 2>/dev/null | head -3 | sed "s|$SRC|<src>|" | cut -c1-170
-          grep -rn "generativelanguage" "$SRC/hermes_cli" 2>/dev/null | head -3 | sed "s|$SRC|<src>|" | cut -c1-170
-          hermes model --help 2>&1 | head -25 | cut -c1-170
+          echo "===== T3) gateway startup surface (hermes v0.21.3) ====="
+          hermes --version 2>&1 | head -1
+          echo "--- hermes gateway --help ---"
+          hermes gateway --help 2>&1 | head -40
+          echo "--- try: hermes gateway start --help ---"
+          hermes gateway start --help 2>&1 | head -30
+          echo "--- docs mentioning telegram gateway ---"
+          ls "$SRC/website/docs/integrations/" 2>/dev/null | head -20
+          grep -rln "telegram" "$SRC/website/docs" 2>/dev/null | head -10 | sed "s|$SRC|<src>|"
 
-          echo "===== 3) backups ====="
-          TS=$(date +%Y%m%d%H%M%S); BK="$H/backups/gemini-apply-$TS"
-          mkdir -p "$BK"
-          for f in config.yaml .env auth.json; do
-            if [ -f "$H/$f" ]; then
-              cp -p "$H/$f" "$BK/$f"
-              echo "backup: $f ($(wc -c < "$BK/$f") bytes) -> ~/.hermes/backups/gemini-apply-$TS/$f"
-            fi
-          done
-          echo "backup_dir=~/.hermes/backups/gemini-apply-$TS"
-
-          restore_all() {
-            for f in config.yaml .env auth.json; do
-              [ -f "$BK/$f" ] && cp -p "$BK/$f" "$H/$f"
-            done
-            echo "[restore] config restored from backup gemini-apply-$TS"
-          }
-
-          write_env_key() {
-            local var="$1"
-            umask 077
-            touch "$H/.env"; chmod 600 "$H/.env"
-            sed -i "/^$var=/d" "$H/.env"
-            printf '%s=%s\n' "$var" "$K" >> "$H/.env"
-            echo ".env: $var lines=$(grep -c "^$var=" "$H/.env") (value never printed)"
-          }
-
-          env_flag() {
-            local var="$1"
-            awk -F= -v v="$var" '$1==v{ if(length($2)>5) print "PRESENT"; else print "EMPTY"; found=1 } END{ if(!found) print "ABSENT" }' "$H/.env"
-          }
-
-          sanitize_cfg() {
-            sed -E 's#(https?://[a-zA-Z0-9.-]+)/[A-Za-z0-9._/?=-]*#\1 [path redacted]#g'
-          }
-
-          validate_cfg() {
-            echo "--- hermes config check ---"
-            hermes config check 2>&1 | head -25 | sanitize_cfg
-            echo "--- effective keys ---"
-            for kk in model.provider model.default model.base_url; do
-              v=$(hermes config get "$kk" 2>/dev/null | sanitize_cfg)
-              echo "$kk = ${v:-<empty>}"
-            done
-            echo "$1: $(env_flag "$1")"
-          }
-
-          real_request() {
-            echo "--- real hermes request (headless, gateway untouched) ---"
-            timeout 150 hermes -z "Reply with exactly: pong" </dev/null >/tmp/req.out 2>&1
-            rc=$?
-            echo "hermes -z rc=$rc"
-            tail -c 400 /tmp/req.out | python3 -c "import sys,re;d=sys.stdin.read();d=re.sub(r'(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}','<redacted>',d);print(d)"
-            if [ $rc -eq 0 ] && grep -qi pong /tmp/req.out; then
-              rm -f /tmp/req.out; return 0
-            fi
-            echo "retry with --safe-mode:"
-            timeout 150 hermes --safe-mode -z "Reply with exactly: pong" </dev/null >/tmp/req.out 2>&1
-            rc=$?
-            echo "hermes --safe-mode -z rc=$rc"
-            tail -c 400 /tmp/req.out | python3 -c "import sys,re;d=sys.stdin.read();d=re.sub(r'(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}','<redacted>',d);print(d)"
-            if [ $rc -eq 0 ] && grep -qi pong /tmp/req.out; then
-              rm -f /tmp/req.out; return 0
-            fi
-            rm -f /tmp/req.out; return 1
-          }
-
-          echo "===== 4) COMBO A: OpenAI-compatible provider -> verified Google shim (instruction 7) ====="
-          PROVIDER_A=""; VAR_A=""
-          for s in openai openrouter; do
-            if hermes config set model.provider "$s" 2>/tmp/seterr; then PROVIDER_A="$s"; break; fi
-            echo "slug '$s' rejected by hermes:"; head -c 200 /tmp/seterr
-          done
-          if [ -n "$PROVIDER_A" ]; then
-            VAR_A="OPENAI_API_KEY"; [ "$PROVIDER_A" = "openrouter" ] && VAR_A="OPENROUTER_API_KEY"
-            echo "combo A: provider=$PROVIDER_A keyvar=$VAR_A"
-            write_env_key "$VAR_A"
-            hermes config set model.default gemini-3-flash-preview
-            hermes config set model.base_url "https://generativelanguage.googleapis.com/v1beta/openai"
-            validate_cfg "$VAR_A"
-            if real_request; then
-              echo "BRANCH_USED=A provider=$PROVIDER_A keyvar=$VAR_A"
-              echo "HERMES_REQUEST=PASS"
-              echo "RESULT=APPLY_OK"
-              shred -u /tmp/gk_tmp 2>/dev/null; exit 0
-            fi
-            echo "combo A real_request FAILED — restoring before combo B"
-            restore_all
+          echo "===== T4) token validity probe via Telegram getMe (server-side only) ====="
+          TOKEN=$(grep '^TELEGRAM_BOT_TOKEN=' "$H/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+          if [ -z "$TOKEN" ]; then
+            echo "getMe: SKIPPED (no token)"
           else
-            echo "combo A unavailable (no openai/openrouter slug) — skipping to combo B"
-            restore_all
+            curl -s --max-time 20 "https://api.telegram.org/bot${TOKEN}/getMe" -o /tmp/getme.json
+            python3 - <<'PY'
+          import json
+          try:
+              d=json.load(open("/tmp/getme.json"))
+              if d.get("ok"):
+                  r=d["result"]
+                  print("getMe: OK | bot @%s | id: %s | is_bot: %s | can_join_groups: %s" % (
+                      r.get("username"), r.get("id"), r.get("is_bot"), r.get("can_join_groups")))
+              else:
+                  print("getMe: FAILED | error:", d.get("error_code"), d.get("description"))
+          except Exception as e:
+              print("getMe: parse fail:", e)
+          PY
+            rm -f /tmp/getme.json
           fi
+          echo "===== T5) pending updates probe (non-consuming offset=0&timeout=0) ====="
+          if [ -n "$TOKEN" ]; then
+            curl -s --max-time 20 "https://api.telegram.org/bot${TOKEN}/getUpdates?offset=0&timeout=0&limit=5" -o /tmp/gu.json
+            python3 - <<'PY'
+          import json
+          try:
+              d=json.load(open("/tmp/gu.json"))
+              if d.get("ok"):
+                  ups=d["result"]
+                  print("getUpdates: OK | pending:", len(ups))
+                  for u in ups[:5]:
+                      m=u.get("message") or u.get("edited_message") or {}
+                      chat=(m.get("chat") or {})
+                      print("  update", u.get("update_id"), "| chat_type:", chat.get("type"), "| chat_id:", "<id:%s digits>" % len(str(chat.get("id"))), "| text?", ("text" in m))
+              else:
+                  print("getUpdates: FAILED |", d.get("error_code"), d.get("description"))
+          except Exception as e:
+              print("getUpdates: parse fail:", e)
+          PY
+            rm -f /tmp/gu.json
+          else echo "getUpdates: SKIPPED (no token)"; fi
+          unset TOKEN
 
-          echo "===== 5) COMBO B: native google provider ====="
-          KEYVAR=""
-          for cand in GEMINI_API_KEY GOOGLE_API_KEY; do
-            if grep -rq "$cand" "$SRC/hermes_cli" 2>/dev/null; then KEYVAR="$cand"; break; fi
-          done
-          if [ -z "$KEYVAR" ]; then
-            echo "RESULT=NOT_READY reason=no_google_keyvar_in_source_and_comboA_failed"
-            restore_all; shred -u /tmp/gk_tmp 2>/dev/null; exit 1
-          fi
-          if hermes config set model.provider google 2>/tmp/seterr; then
-            echo "combo B: provider=google keyvar=$KEYVAR"
-          else
-            echo "slug 'google' rejected:"; head -c 200 /tmp/seterr
-            echo "RESULT=NOT_READY reason=google_provider_missing_and_comboA_failed"
-            restore_all; shred -u /tmp/gk_tmp 2>/dev/null; exit 1
-          fi
-          write_env_key "$KEYVAR"
-          hermes config set model.default gemini-3-flash-preview
-          hermes config unset model.base_url 2>/dev/null || hermes config set model.base_url ""
-          validate_cfg "$KEYVAR"
-          if real_request; then
-            echo "BRANCH_USED=B provider=google keyvar=$KEYVAR"
-            echo "HERMES_REQUEST=PASS"
-            echo "RESULT=APPLY_OK"
-            shred -u /tmp/gk_tmp 2>/dev/null; exit 0
-          fi
-          echo "combo B real_request FAILED — full restore"
-          restore_all
-          echo "HERMES_REQUEST=FAIL"
-          echo "RESULT=NOT_READY reason=both_combos_failed_real_request"
-          shred -u /tmp/gk_tmp 2>/dev/null; exit 1
+          echo "===== T6) existing gateway process / port sanity ====="
+          pgrep -af "hermes" | grep -vi pgrep | head -10 || echo "no hermes processes running"
+
+          echo "===== AUDIT_MARKER ====="
+          echo "PHASE1_AUDIT_DONE"
           REMOTE
-
-      - name: Cleanup runner key material (always)
-        if: always()
-        run: |
-          shred -u /tmp/gkey 2>/dev/null || true
-          rm -f /tmp/cp.err /tmp/sshcfg 2>/dev/null || true
-          echo "runner key material removed"
