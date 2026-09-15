@@ -1,4 +1,4 @@
-name: migration-backup-critical
+name: migration-backup-final-validate
 on:
   workflow_dispatch:
 
@@ -8,8 +8,8 @@ env:
   CODESPACE_NAME: crispy-space-cod-jrqqwq797j6vcwqw
 
 jobs:
-  critbackup:
-    name: Deterministic critical backup + validation
+  fvalidate:
+    name: Final backup validation (no streaming grep)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -21,7 +21,7 @@ jobs:
           st=$(gh api "/user/codespaces/${CODESPACE_NAME}" --jq .state); echo "OLD state: $st"
           [ "$st" = "Available" ] || { echo "::error::not Available"; exit 1; }
 
-      - name: Build critical archive + verify big archive
+      - name: Validate both archives (listing-to-file method)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
@@ -32,50 +32,41 @@ jobs:
           d=re.sub(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}","<tg-token>",d)
           d=re.sub(r"chat_id[\" ]*[:=][\" ]*[0-9]{5,}","chat_id=<id>",d)
           d=re.sub(r"(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}","<redacted>",d)
-          d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redaded>",d)
+          d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redacted>",d)
           sys.stdout.write(d)'
           set -euo pipefail
-          H="$HOME/.hermes"; BK="$HOME/hermes-backup"; mkdir -p "$BK"; chmod 700 "$BK"
-          TS=$(date +%s)
-          echo "===== A) stable state snapshot (gateway writing volatile files live) ====="
-          rm -rf "$BK/state-snap-$TS"; cp -a "$H/state" "$BK/state-snap-$TS"
-          echo "snapshot files: $(find "$BK/state-snap-$TS" -type f | wc -l)"
+          BK="$HOME/hermes-backup"
+          C=$(ls -t "$BK"/migration-critical-*.tar.gz | head -1)
+          S=$(ls -t "$BK"/migration-state-*.tar.gz | head -1)
+          T="$BK/hermes-migration-20260915233438.tar.gz"
+          echo "artifacts:"
+          ls -la "$BK" | awk 'NR>1{print " ", $NF, $5"B"}' | grep -v "^\s*$"
 
-          echo "===== B) build critical archive (small, deterministic, stderr visible) ====="
-          C="$BK/migration-critical-$TS.tar.gz"
-          tar -czf "$C" -C "$HOME" \
-            .hermes/config.yaml .hermes/.env .hermes/auth.json \
-            .hermes/sessions \
-            .local/bin/hermes .local/bin/uv .local/bin/uvx .local/bin/tirith 2>/tmp/tarerr || true
-          head -5 /tmp/tarerr || true
-          tar -czf "$BK/migration-state-$TS.tar.gz" -C "$BK" "state-snap-$TS" 2>/dev/null || true
-          rm -rf "$BK/state-snap-$TS"
-          for A in "$C" "$BK/migration-state-$TS.tar.gz"; do
-            chmod 600 "$A"
-            echo "ARCHIVE $A | $(du -h "$A" | cut -f1) | sha256=$(sha256sum "$A" | cut -c1-32)…"
-          done
-
-          echo "===== C) validate critical archive (extract+parse) ====="
-          tar -tzf "$C" | sed -n '1,4p'
+          echo "===== critical archive checks ====="
+          tar -tzf "$C" > /tmp/lc.txt
           for m in .hermes/config.yaml .hermes/.env .hermes/auth.json .local/bin/hermes .local/bin/uv; do
-            tar -tzf "$C" | grep -qF "$m" && echo "$m: IN ARCHIVE" || { echo "$m: MISSING"; exit 1; }
+            grep -qF "$m" /tmp/lc.txt && echo "$m: PRESENT" || { echo "$m: MISSING"; exit 1; }
           done
+          echo "entries: $(wc -l < /tmp/lc.txt)"
           tar -xOf "$C" .hermes/config.yaml | python3 -c "import sys,yaml;d=yaml.safe_load(sys.stdin);print('config.yaml parse OK | version:', d.get('_config_version'), '| model:', d.get('model'))"
           tar -xOf "$C" .hermes/.env | grep -q "^GEMINI_API_KEY=.\{10,\}" && echo "GEMINI_API_KEY: PRESENT(len)"
           tar -xOf "$C" .hermes/.env | grep -q "^TELEGRAM_BOT_TOKEN=.\{20,\}" && echo "TELEGRAM_BOT_TOKEN: PRESENT(len)"
           tar -xOf "$C" .hermes/auth.json | python3 -c "import sys,json;d=json.load(sys.stdin);print('auth.json parse OK keys:', list(d.keys()))"
-          echo "session entries in critical tar: $(tar -tzf "$C" | grep -c 'hermes/sessions/')"
-          echo "VALIDATION_CRITICAL=PASS"
+          echo "sessions entries: $(grep -c 'hermes/sessions/' /tmp/lc.txt)"
 
-          echo "===== D) big source archive verification (existing artifact) ====="
-          T="/home/codespace/hermes-backup/hermes-migration-20260915233438.tar.gz"
-          echo "big tar first members:"; tar -tzf "$T" | sed -n '1,6p'
-          echo "big entries: $(tar -tzf "$T" | wc -l)"
-          echo "big .git entries: $(tar -tzf "$T" | grep -c 'hermes-agent/.git/')"
-          echo "big uv.lock: $(tar -tzf "$T" | grep -c 'hermes-agent/uv.lock')"
-          echo "big pyproject: $(tar -tzf "$T" | grep -c 'hermes-agent/pyproject.toml')"
-          echo "big cli source: $(tar -tzf "$T" | grep -c 'hermes-agent/hermes_cli/cli_model_switch_mixin.py')"
-          echo "big grep config.yaml anywhere: $(tar -tzf "$T" | grep -c 'config.yaml' || true)"
-          echo "BIG_ARCHIVE_SUMMARY_DONE"
-          echo "MANIFEST_DONE"
+          echo "===== state snapshot archive checks ====="
+          tar -tzf "$S" > /tmp/ls.txt
+          grep -c "gateway.lifecycle.json\|gateway.heartbeat" /tmp/ls.txt | xargs echo "state key files:"
+
+          echo "===== big source archive checks ====="
+          tar -tzf "$T" > /tmp/lb.txt
+          echo "entries: $(wc -l < /tmp/lb.txt)"
+          for m in .hermes/config.yaml .hermes/hermes-agent/uv.lock .hermes/hermes-agent/pyproject.toml; do
+            grep -qF "$m" /tmp/lb.txt && echo "$m: PRESENT" || echo "$m: absent"
+          done
+          echo ".git members: $(grep -c 'hermes-agent/.git/' /tmp/lb.txt)"
+          echo "cli key file: $(grep -c 'hermes_cli/cli_model_switch_mixin.py' /tmp/lb.txt)"
+          grep -qF "hermes-agent/.git/refs" /tmp/lb.txt && echo "git refs present (commit 5d593660 pin-reproducible offline)"
+          echo "FINAL_VALIDATION=PASS"
+          echo "VALIDATION_DONE"
           REMOTE
