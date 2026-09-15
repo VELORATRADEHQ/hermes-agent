@@ -1,4 +1,4 @@
-name: telegram-phase1-audit
+name: telegram-phase2-launch
 on:
   workflow_dispatch:
 
@@ -6,8 +6,8 @@ permissions:
   contents: read
 
 jobs:
-  audit:
-    name: Telegram Phase-1 READ-ONLY audit
+  launch:
+    name: Telegram Phase-2 launch gateway (test-scoped)
     runs-on: ubuntu-latest
     env:
       CODESPACE_NAME: crispy-space-cod-jrqqwq797j6vcwqw
@@ -22,7 +22,7 @@ jobs:
           echo "codespace state: $state"
           [ "$state" = "Available" ] || { echo "::error::Not Available; NO start performed (policy)"; exit 1; }
 
-      - name: Read-only Telegram audit inside codespace
+      - name: Start gateway (test-scoped, foreground-based, killable) + readiness
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
@@ -31,6 +31,7 @@ jobs:
           import sys,re
           d=sys.stdin.buffer.read().decode("utf-8","replace")
           d=re.sub(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}","<tg-token>",d)
+          d=re.sub(r"chat_id[\" ]*[:=][\" ]*[0-9]{5,}","chat_id=<id>",d)
           d=re.sub(r"(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}","<redacted>",d)
           d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redacted>",d)
           sys.stdout.write(d)'
@@ -38,104 +39,56 @@ jobs:
           H="$HOME/.hermes"; SRC="$H/hermes-agent"
           export PATH="$H/bin:$PATH"
 
-          echo "===== T1) .env telegram surface (KEY NAMES + flags only) ====="
-          if [ -f "$H/.env" ]; then
-            echo ".env exists ($(wc -c < "$H/.env") bytes)"
-            awk -F= '/^(TELEGRAM|TG_|BOT_)/{print "key:", $1}' "$H/.env"
-            if grep -q '^TELEGRAM_BOT_TOKEN=.\{20,\}' "$H/.env"; then echo "TELEGRAM_BOT_TOKEN: PRESENT (length-ok, value never read into output)"
-            elif grep -q '^TELEGRAM_BOT_TOKEN=' "$H/.env"; then echo "TELEGRAM_BOT_TOKEN: PRESENT-BUT-SHORT (suspicious)"
-            else echo "TELEGRAM_BOT_TOKEN: MISSING"; fi
-            for v in TELEGRAM_ALLOWED_USERS TELEGRAM_ADMIN_IDS ALLOWED_USERS TG_ALLOWED_USERS; do
-              if grep -q "^$v=..*" "$H/.env"; then echo "$v: PRESENT"; else echo "$v: absent"; fi
-            done
-            echo "GEMINI_API_KEY flag: $(awk -F= '$1=="GEMINI_API_KEY"{print (length($2)>5)?"PRESENT":"EMPTY"}' "$H/.env")"
-          else
-            echo ".env MISSING"; fi
+          echo "===== A) allowlist behavior evidence (source, read-only) ====="
+          grep -rn "allowed_users\|allowlist\|allow_list\|TELEGRAM_ALLOWED\|allowed\b" "$SRC/hermes_cli" 2>/dev/null \
+            | grep -i "tele\|gateway\|allow" | head -12 | sed "s|$SRC|<src>|" | cut -c1-180
 
-          echo "===== T2) config.yaml telegram/gateway keys (structure only; values classified) ====="
-          python3 - <<'PY'
-          import yaml,sys
-          try:
-              d=yaml.safe_load(open("/home/codespace/.hermes/config.yaml"))
-          except Exception as e:
-              print("config.yaml load error:", e); sys.exit(0)
-          def walk(node, path=""):
-              if isinstance(node, dict):
-                  for k,v in node.items(): walk(v, f"{path}{k}.")
-              else:
-                  p=path[:-1]
-                  if p.split(".")[0] in ("telegram","gateway","messaging"):
-                      if isinstance(node,bool) or node in (None,""):
-                          print(f"  {p} = {node}")
-                      elif isinstance(node,(int,float)):
-                          print(f"  {p} = <number>")
-                      elif isinstance(node,list):
-                          print(f"  {p} = <list:{len(node)} items>")
-                      else:
-                          s=str(node)
-                          print(f"  {p} = <string:{len(s)} chars>")
-          walk(d)
-          keys=list(d.keys()) if isinstance(d,dict) else []
-          print("  top-level keys:", keys)
-          PY
-
-          echo "===== T3) gateway startup surface (hermes v0.21.3) ====="
-          hermes --version 2>&1 | head -1
-          echo "--- hermes gateway --help ---"
-          hermes gateway --help 2>&1 | head -40
-          echo "--- try: hermes gateway start --help ---"
-          hermes gateway start --help 2>&1 | head -30
-          echo "--- docs mentioning telegram gateway ---"
-          ls "$SRC/website/docs/integrations/" 2>/dev/null | head -20
-          grep -rln "telegram" "$SRC/website/docs" 2>/dev/null | head -10 | sed "s|$SRC|<src>|"
-
-          echo "===== T4) token validity probe via Telegram getMe (server-side only) ====="
-          TOKEN=$(grep '^TELEGRAM_BOT_TOKEN=' "$H/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
-          if [ -z "$TOKEN" ]; then
-            echo "getMe: SKIPPED (no token)"
-          else
-            curl -s --max-time 20 "https://api.telegram.org/bot${TOKEN}/getMe" -o /tmp/getme.json
-            python3 - <<'PY'
-          import json
-          try:
-              d=json.load(open("/tmp/getme.json"))
-              if d.get("ok"):
-                  r=d["result"]
-                  print("getMe: OK | bot @%s | id: %s | is_bot: %s | can_join_groups: %s" % (
-                      r.get("username"), r.get("id"), r.get("is_bot"), r.get("can_join_groups")))
-              else:
-                  print("getMe: FAILED | error:", d.get("error_code"), d.get("description"))
-          except Exception as e:
-              print("getMe: parse fail:", e)
-          PY
-            rm -f /tmp/getme.json
+          echo "===== B) pre-check: no gateway already running ====="
+          if pgrep -af "hermes.*gateway" | grep -vi pgrep >/dev/null 2>&1; then
+            echo "gateway process already exists — refusing double-start"
+            pgrep -af "hermes.*gateway" | grep -vi pgrep | head -5
+            echo "GATEWAY_UP=ALREADY_RUNNING"; exit 1
           fi
-          echo "===== T5) pending updates probe (non-consuming offset=0&timeout=0) ====="
-          if [ -n "$TOKEN" ]; then
-            curl -s --max-time 20 "https://api.telegram.org/bot${TOKEN}/getUpdates?offset=0&timeout=0&limit=5" -o /tmp/gu.json
-            python3 - <<'PY'
-          import json
-          try:
-              d=json.load(open("/tmp/gu.json"))
-              if d.get("ok"):
-                  ups=d["result"]
-                  print("getUpdates: OK | pending:", len(ups))
-                  for u in ups[:5]:
-                      m=u.get("message") or u.get("edited_message") or {}
-                      chat=(m.get("chat") or {})
-                      print("  update", u.get("update_id"), "| chat_type:", chat.get("type"), "| chat_id:", "<id:%s digits>" % len(str(chat.get("id"))), "| text?", ("text" in m))
-              else:
-                  print("getUpdates: FAILED |", d.get("error_code"), d.get("description"))
-          except Exception as e:
-              print("getUpdates: parse fail:", e)
-          PY
-            rm -f /tmp/gu.json
-          else echo "getUpdates: SKIPPED (no token)"; fi
-          unset TOKEN
+          echo "none running — ok"
 
-          echo "===== T6) existing gateway process / port sanity ====="
-          pgrep -af "hermes" | grep -vi pgrep | head -10 || echo "no hermes processes running"
+          echo "===== C) start: hermes gateway run (detached for test window) ====="
+          cd "$HOME"
+          nohup hermes gateway --accept-hooks run > /tmp/hermes-gateway.log 2>&1 &
+          GPID=$!
+          echo "$GPID" > /tmp/gw.pid
+          echo "spawned pid: $GPID"
+          sleep 3
 
-          echo "===== AUDIT_MARKER ====="
-          echo "PHASE1_AUDIT_DONE"
+          echo "===== D) readiness polling (max ~150s) ====="
+          READY=0
+          for i in $(seq 1 30); do
+            if ! kill -0 "$GPID" 2>/dev/null; then
+              echo "process $GPID DIED at poll $i"; READY=-1; break
+            fi
+            if grep -qiE "poll|telegram gateway|listening|getMe|connected|✓.*telegram|webhook" /tmp/hermes-gateway.log 2>/dev/null; then
+              echo "readiness marker found at poll $i (~$((i*5))s)"; READY=1; break
+            fi
+            sleep 5
+          done
+          echo "READY=$READY"
+          echo "--- effective config (redacted) ---"
+          echo "model.provider = $(hermes config get model.provider 2>/dev/null)"
+          echo "model.default  = $(hermes config get model.default 2>/dev/null)"
+          kill -0 "$GPID" 2>/dev/null && echo "process alive: pid $GPID" || echo "process NOT alive"
+
+          echo "===== E) gateway log (sanitized, first 50 lines) ====="
+          head -50 /tmp/hermes-gateway.log 2>/dev/null | cut -c1-200
+
+          echo "===== F) verdict ====="
+          if [ "$READY" = "1" ]; then
+            echo "GATEWAY_UP=YES pid=$GPID"
+          else
+            echo "GATEWAY_UP=NO"
+            echo "--- last 30 log lines ---"
+            tail -30 /tmp/hermes-gateway.log 2>/dev/null | cut -c1-200
+            kill "$GPID" 2>/dev/null; sleep 2; kill -9 "$GPID" 2>/dev/null
+            echo "(attempted cleanup)"
+            echo "RESULT=NOT_READY reason=gateway_failed_to_start"
+            exit 1
+          fi
           REMOTE
