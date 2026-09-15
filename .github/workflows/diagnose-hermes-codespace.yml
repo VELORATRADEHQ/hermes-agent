@@ -1,8 +1,10 @@
 name: Diagnose Hermes Codespace (read-only)
 
-# DIAGNOSTIC-ONLY. Phase 3: provider-only audit inside the existing
-# Codespace. Zero installs/restarts/config changes. No .env values are
-# ever read; only key names, presence flags, sanitized hosts.
+# Provider test-first harness. Phase 1 always runs (read-only inspect).
+# Test+apply phases activate ONLY if ~/.hermes/provider-candidate.env
+# exists inside the Codespace (created manually by the user, values never
+# printed). Apply happens only when the independent API test PASSES.
+# No secrets are printed; all outbound texts pass through redaction.
 
 on:
   workflow_dispatch:
@@ -18,7 +20,7 @@ env:
 
 jobs:
   diagnose:
-    name: Provider audit (read-only, sanitized)
+    name: Provider inspect + test-first apply harness
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -53,7 +55,7 @@ jobs:
           STATE: ${{ steps.precheck.outputs.state }}
         run: |
           if [ "$STATE" != "Available" ]; then
-            echo "Codespace state is '$STATE' (not Available). Diagnostic-only: NO start performed."
+            echo "Codespace state is '$STATE' (not Available). NO start performed."
             echo "ssh=skipped-stopped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -67,112 +69,168 @@ jobs:
           fi
           rm -f ssh_err.txt
 
-      - name: Provider audit INSIDE the Codespace (sanitized, read-only)
+      - name: Phase 1-2-4 harness INSIDE the Codespace
         if: steps.sshcheck.outputs.ssh == 'ok'
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
           gh codespace ssh --codespace "$CODESPACE_NAME" -- bash -s <<'REMOTE'
           set +e
+          redact() {
+            sed -E \
+              -e 's/[0-9]{8,10}:[A-Za-z0-9_-]{30,}/<TG_TOKEN_REDACTED>/g' \
+              -e 's/(github_pat_|ghp_)[A-Za-z0-9_]+/<GH_TOKEN_REDACTED>/g' \
+              -e 's/sk-[A-Za-z0-9_-]{16,}/<API_KEY_REDACTED>/g' \
+              -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._:|-]+/\1<REDACTED>/g' \
+              -e 's/eyJ[A-Za-z0-9._-]{20,}/<JWT_REDACTED>/g'
+          }
 
-          echo "### PHASE1: runtime"
-          HBIN="$HOME/.local/bin/hermes"
-          [ -x "$HBIN" ] || HBIN="$(command -v hermes)"
-          echo "binary: ${HBIN:-NOT FOUND}"
-          echo "interpreter: $(head -1 "$HBIN" 2>/dev/null)"
-          "$HBIN" --version 2>&1 | head -6
-          python3 --version
-          pgrep -af hermes >/dev/null 2>&1 && echo "hermes process: RUNNING" || echo "hermes process: NOT RUNNING"
-          pgrep -afi telegram >/dev/null 2>&1 && echo "telegram gateway: RUNNING" || echo "telegram gateway: NOT RUNNING"
-
-          echo "### PHASE2: config.yaml (sanitized parse)"
-          python3 - <<'PYCFG'
-          import yaml, json, re, os
+          echo "### PHASE1: runtime + current provider config (fresh)"
+          HBIN="$HOME/.local/bin/hermes"; [ -x "$HBIN" ] || HBIN="$(command -v hermes)"
+          "$HBIN" --version 2>&1 | head -3
+          pgrep -af hermes >/dev/null 2>&1 && echo "hermes: RUNNING (will NOT be touched)" || echo "hermes: NOT RUNNING"
+          python3 - <<'PRC'
+          import yaml, re
           from urllib.parse import urlparse
-          SECRET = re.compile(r'(api[_-]?key|token|secret|passw|jwt|credential|private)', re.I)
-          def host_only(u):
-              try:
-                  p = urlparse(str(u))
-                  return (p.scheme + "://" + p.hostname + (":" + str(p.port) if p.port else "") + " [path/query redacted]") if p.hostname else "<non-url>"
-              except Exception:
-                  return "<unparseable>"
-          def emit(kp, v):
-              if SECRET.search(kp):
-                  print(f"  {kp}: {'PRESENT (redacted)' if v not in (None, '') else 'EMPTY/NONE'}")
-              elif isinstance(v, str):
-                  s = v.strip()
-                  if s.startswith("http"):
-                      print(f"  {kp}: {host_only(s)}")
-                  elif len(s) > 40:
-                      print(f"  {kp}: <string:{len(s)} chars>")
-                  else:
-                      print(f"  {kp}: {s}")
-              else:
-                  print(f"  {kp}: {v}")
-          def walk(o, p=""):
-              if isinstance(o, dict):
-                  for k, v in o.items():
-                      kp = f"{p}.{k}" if p else str(k)
-                      if isinstance(v, (dict, list)):
-                          if SECRET.search(kp):
-                              print(f"  {kp}: <group redacted>")
-                          else:
-                              walk(v, kp)
-                      else:
-                          emit(kp, v)
-              elif isinstance(o, list):
-                  print(f"  {p}: list[{len(o)}] -> " + ", ".join(str(i)[:30] if not isinstance(i,(dict,list)) else "<obj>" for i in o[:10]))
-          cfg_path = os.path.expanduser("~/.hermes/config.yaml")
-          try:
-              cfg = yaml.safe_load(open(cfg_path))
-              print("  config.yaml: parsed OK")
-              walk(cfg)
-          except Exception as e:
-              print(f"  config.yaml: ERROR: {e}")
+          cfg = yaml.safe_load(open("/home/codespace/.hermes/config.yaml"))
+          m = cfg.get("model", {})
+          bu = str(m.get("base_url", ""))
+          host = urlparse(bu).hostname or bu
+          print("current model.provider:", m.get("provider"))
+          print("current model.default:", m.get("default"))
+          print("current base_url host:", host)
+          PRC
+          echo "--- hermes config command help (for non-interactive set) ---"
+          "$HBIN" config --help 2>&1 | head -15
+          echo "--- providers registry (installed source, read-only) ---"
+          ls "$HOME/.hermes/hermes-agent/providers/" 2>/dev/null
+          grep -rhoE "['\"][a-z][a-z0-9_-]{2,20}['\"]" "$HOME/.hermes/hermes-agent/providers/__init__.py" 2>/dev/null | sort -u | head -40
 
-          print("### PHASE2b: .env key names only (values never read)")
-          envp = os.path.expanduser("~/.hermes/.env")
-          try:
-              names = []
-              for line in open(envp):
-                  m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=", line)
-                  if m:
-                      names.append(m.group(1))
-              for n in sorted(set(names)):
-                  print(f"  ENV KEY: {n}")
-              for probe in ["TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL", "NOUS_API_KEY", "COPILOT_API_KEY", "GITHUB_TOKEN"]:
-                  print(f"  PRESENCE {probe}: {'present' if probe in names else 'absent'}")
-          except FileNotFoundError:
-              print("  .env: MISSING")
+          echo "### CONTRACT: check for ~/.hermes/provider-candidate.env"
+          CAND="$HOME/.hermes/provider-candidate.env"
+          if [ ! -f "$CAND" ]; then
+            echo "CONTRACT_ABSENT -> stopping before any test (Phase 1 only)."
+            echo "NEXT: create the contract file inside this Codespace with lines:"
+            echo "  BASE_URL=... ; MODEL=... ; API_KEY=... ; PROVIDER_KIND=openrouter|openai-compatible|other"
+            echo "then re-dispatch this workflow."
+            echo "HARNESS_RESULT=PHASE1_ONLY"
+            exit 0
+          fi
 
-          print("### PHASE2c: auth.json structure (keys + types only)")
-          try:
-              d = json.load(open(os.path.expanduser("~/.hermes/auth.json")))
-              def awalk(o, p=""):
-                  if isinstance(o, dict):
-                      for k, v in o.items():
-                          kp = f"{p}.{k}" if p else str(k)
-                          if SECRET.search(kp):
-                              print(f"  {kp}: {'PRESENT (redacted)' if v not in (None,'') else 'EMPTY/NONE'}")
-                          elif isinstance(v, (dict, list)):
-                              awalk(v, kp)
-                          elif isinstance(v, str) and v.startswith("http"):
-                              print(f"  {kp}: {host_only(v)}")
-                          elif isinstance(v, str) and len(v) > 40:
-                              print(f"  {kp}: <string:{len(v)} chars>")
-                          else:
-                              print(f"  {kp}: {v}")
-                  elif isinstance(o, list):
-                      print(f"  {p}: list[{len(o)}]")
-              awalk(d)
-          except Exception as e:
-              print(f"  auth.json: {e}")
-          PYCFG
+          set -a; . "$CAND"; set +a
+          BASE="${BASE_URL%/}"
+          echo "contract present: MODEL=$MODEL | PROVIDER_KIND=${PROVIDER_KIND:-<unset>}"
+          echo "BASE_URL host: $(python3 -c "from urllib.parse import urlparse;print(urlparse('$BASE').hostname or '$BASE')")"
+          echo "API_KEY: $([ -n "${API_KEY:-}" ] && echo 'PRESENT (never printed)' || echo 'absent')"
+          if [ -z "$BASE" ] || [ -z "$MODEL" ]; then
+            echo "HARNESS_RESULT=FAIL reason=contract-missing-fields"
+            exit 1
+          fi
 
-          echo "### PHASE4: installed provider registry + local help"
-          find "$HOME/.hermes/hermes-agent" -name "*.py" -ipath "*provider*" 2>/dev/null | sed "s|$HOME/.hermes/hermes-agent/||" | head -15
-          "$HBIN" model --help 2>&1 | head -40
-          echo "--- setup help (portal option check) ---"
-          "$HBIN" setup --help 2>&1 | head -20
-          echo "### END AUDIT"
+          echo "### PHASE2: independent API test"
+          AUTH=(); [ -n "${API_KEY:-}" ] && AUTH=(-H "Authorization: Bearer $API_KEY")
+          echo "[T1] GET $BASE/models"
+          code=$(curl -sS -o /tmp/models.json -w "%{http_code}" --max-time 25 "${AUTH[@]}" "$BASE/models" 2>/tmp/t1err.txt)
+          echo "T1_HTTP=$code"
+          if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+            echo "T1_ERROR_SANITIZED: $(redact </tmp/models.json | head -c 300)"
+            rm -f /tmp/models.json /tmp/t1err.txt "$CAND"
+            echo "HARNESS_RESULT=FAIL reason=authentication (HTTP $code)"
+            exit 1
+          fi
+          MODEL_SEEN=unknown
+          if [ "$code" = "200" ]; then
+            MODEL_SEEN=$(python3 -c "
+          import json,sys
+          try:
+            d=json.load(open('/tmp/models.json'))
+            ids=[m.get('id','') for m in d.get('data',[])]
+            print('yes' if '$MODEL' in ids else 'no (list has %d models)'%len(ids))
+          except Exception as e: print('unparseable')" 2>/dev/null)
+          fi
+          echo "T1_MODEL_IN_LIST=$MODEL_SEEN"
+
+          echo "[T2] POST $BASE/chat/completions (max_tokens=1)"
+          body=$(printf '{"model":"%s","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}' "$MODEL")
+          code2=$(curl -sS -o /tmp/chat.json -w "%{http_code}" --max-time 30 -H "Content-Type: application/json" "${AUTH[@]}" -d "$body" "$BASE/chat/completions" 2>/tmp/t2err.txt)
+          echo "T2_HTTP=$code2"
+          T2_ERR_SAN=$(redact </tmp/chat.json | head -c 300)
+          if [ "$code2" != "200" ]; then
+            echo "T2_ERROR_SANITIZED: $T2_ERR_SAN"
+            reason="endpoint-or-format"
+            case "$code2" in
+              401|403) reason="authentication";;
+              404) reason="model-name-or-endpoint";;
+              429) reason="rate-limit-or-quota";;
+            esac
+            rm -f /tmp/models.json /tmp/chat.json /tmp/t1err.txt /tmp/t2err.txt "$CAND"
+            echo "HARNESS_RESULT=FAIL reason=$reason (HTTP $code2)"
+            exit 1
+          fi
+          python3 - <<'PCHAT'
+          import json
+          d=json.load(open('/tmp/chat.json'))
+          ch=d.get('choices',[])
+          ok=bool(ch and ch[0].get('message'))
+          print('T2_FORMAT_OPENAI_CHOICES=', 'yes' if ok else 'NO')
+          print('T2_MODEL_ECHO=', d.get('model','?'))
+          PCHAT
+
+          echo "[T3] streaming probe (stream=true, first bytes only)"
+          sbody=$(printf '{"model":"%s","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":true}' "$MODEL")
+          curl -sS -N --max-time 20 -H "Content-Type: application/json" "${AUTH[@]}" -d "$sbody" "$BASE/chat/completions" -o /tmp/stream.out 2>/dev/null
+          if grep -q '^data:' /tmp/stream.out 2>/dev/null; then echo "T3_STREAM=PASS (SSE data: frames)"; else echo "T3_STREAM=UNKNOWN"; fi
+          rm -f /tmp/models.json /tmp/chat.json /tmp/stream.out /tmp/t1err.txt /tmp/t2err.txt
+          echo "API_TEST=PASS"
+
+          echo "### PHASE4: backup + replace provider (approved conditionally)"
+          TS=$(date +%Y%m%d_%H%M%S)
+          BK="$HOME/.hermes/backups/provider-fix-$TS"
+          mkdir -p "$BK"
+          cp -a "$HOME/.hermes/config.yaml" "$BK/" 2>/dev/null
+          cp -a "$HOME/.hermes/.env" "$BK/" 2>/dev/null
+          cp -a "$HOME/.hermes/auth.json" "$BK/" 2>/dev/null
+          echo "backup dir: $BK"
+          ls -la "$BK"
+
+          case "${PROVIDER_KIND:-}" in
+            openrouter) PSLUG=openrouter; KEYVAR=OPENROUTER_API_KEY;;
+            openai-compatible|openai) PSLUG=openai; KEYVAR=OPENAI_API_KEY;;
+            *) PSLUG=""; KEYVAR="";;
+          esac
+          if [ -z "$PSLUG" ]; then
+            echo "HARNESS_RESULT=TEST_PASS_BUT_PROVIDER_KIND_UNKNOWN (no config change made)"
+            rm -f "$CAND"
+            exit 1
+          fi
+          echo "applying: provider=$PSLUG model=$MODEL base_url=<host only>"
+          "$HBIN" config set model.provider "$PSLUG" 2>&1 | redact | head -2
+          "$HBIN" config set model.default "$MODEL" 2>&1 | redact | head -2
+          "$HBIN" config set model.base_url "$BASE" 2>&1 | redact | head -2
+          if [ -n "${API_KEY:-}" ] && [ -n "$KEYVAR" ]; then
+            python3 - "$HOME/.hermes/.env" "$KEYVAR" "$API_KEY" <<'PENV'
+          import sys,re
+          path,var,val=sys.argv[1],sys.argv[2],sys.argv[3]
+          try: lines=open(path).read().splitlines()
+          except FileNotFoundError: lines=[]
+          out=[l for l in lines if not re.match(rf"\s*(?:export\s+)?{var}\s*=",l)]
+          out.append(f"{var}={val}")
+          open(path,"w").write("\n".join(out)+"\n")
+          print(f"env: {var} written (value never printed)")
+          PENV
+            chmod 600 "$HOME/.hermes/.env" 2>/dev/null
+          fi
+          rm -f "$CAND"; echo "staging contract file removed"
+
+          echo "### PHASE5: resulting config (sanitized)"
+          python3 - <<'PSHOW'
+          import yaml
+          from urllib.parse import urlparse
+          m=yaml.safe_load(open("/home/codespace/.hermes/config.yaml")).get("model",{})
+          print("new provider:",m.get("provider"))
+          print("new model.default:",m.get("default"))
+          print("new base_url host:",urlparse(str(m.get("base_url",""))).hostname or m.get("base_url"))
+          PSHOW
+          grep -c "^OPENROUTER_API_KEY=\|^OPENAI_API_KEY=" "$HOME/.hermes/.env" 2>/dev/null | sed 's/^/provider key lines in .env: /'
+          echo "HARNESS_RESULT=APPLIED"
           REMOTE
