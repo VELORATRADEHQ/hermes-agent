@@ -1,4 +1,4 @@
-name: gateway-postmortem
+name: lifecycle-sentinel-read
 on:
   workflow_dispatch:
 
@@ -6,13 +6,13 @@ permissions:
   contents: read
 
 jobs:
-  postmortem:
-    name: READ-ONLY gateway post-mortem
+  sentinel:
+    name: READ-ONLY lifecycle sentinel read
     runs-on: ubuntu-latest
     env:
       CODESPACE_NAME: crispy-space-cod-jrqqwq797j6vcwqw
     steps:
-      - name: Preconditions + state gate
+      - name: State gate
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
@@ -20,9 +20,9 @@ jobs:
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
           state=$(gh api "/user/codespaces/${CODESPACE_NAME}" --jq .state)
           echo "codespace state: $state"
-          [ "$state" = "Available" ] || { echo "::error::Not Available; abort"; exit 1; }
+          [ "$state" = "Available" ] || { echo "::error::Not Available"; exit 1; }
 
-      - name: Collect post-mortem evidence (read-only)
+      - name: Read lifecycle sentinel + module (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
@@ -31,78 +31,31 @@ jobs:
           import sys,re
           d=sys.stdin.buffer.read().decode("utf-8","replace")
           d=re.sub(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}","<tg-token>",d)
-          d=re.sub(r"chat_id[\" ]*[:=][\" ]*[0-9]{5,}","chat_id=<id>",d)
           d=re.sub(r"(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}","<redacted>",d)
-          d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redacted>",d)
+          d=re.sub(r"chat_id[\" ]*[:=][\" ]*[0-9]{5,}","chat_id=<id>",d)
           sys.stdout.write(d)'
           set -uo pipefail
           H="$HOME/.hermes"; SRC="$H/hermes-agent"
-          export PATH="$H/bin:$PATH"
-          LOG=/tmp/hermes-gateway.log
 
-          echo "===== P1) process state now ====="
-          pgrep -af "hermes" | grep -vi pgrep | head -5 | cut -c1-120 || echo "no hermes process running (expected: VM was stopped)"
-          date -u '+codespace clock now (UTC): %Y-%m-%dT%H:%M:%S'
+          echo "===== S1) sentinel path from installed source ====="
+          sed -n '980,1010p' "$SRC/hermes_cli/gateway_windows.py" 2>/dev/null | cut -c1-190 | grep -nE "sentinel|path|json|return" | head -12
+          grep -rn "get_lifecycle_sentinel_path\|SENTINEL" "$SRC/gateway/" 2>/dev/null | head -10 | sed "s|$SRC|<src>|" | cut -c1-170
 
-          echo "===== P2) log identity ====="
-          if [ -f "$LOG" ]; then
-            echo "log lines: $(wc -l < "$LOG") | mtime: $(stat -c %y "$LOG" | cut -d. -f1) | size: $(wc -c < "$LOG") bytes"
-          else echo "LOG MISSING"; fi
+          echo "===== S2) locate sentinel file on disk ====="
+          find "$H" -maxdepth 3 \( -iname "*sentinel*" -o -iname "*lifecycle*" -o -iname "*ledger*" \) 2>/dev/null | head -10 | sed "s|$HOME|~|"
 
-          echo "===== P3) last successful turns (delivery/completion markers) ====="
-          grep -inE "delivered|sendMessage|sent|✓|completed in|answer" "$LOG" 2>/dev/null | grep -viE "check_fn|unable|unavailable|failed" | tail -20 | cut -c1-200
+          echo "===== S3) dump sentinel/ledger content (sanitized) ====="
+          for f in $(find "$H" -maxdepth 3 \( -iname "*sentinel*" -o -iname "*lifecycle*" \) -type f 2>/dev/null | head -4); do
+            echo "--- ${f/#$HOME/~} ($(wc -c < "$f") bytes) ---"
+            head -c 1500 "$f" | cut -c1-200 | head -30
+            echo
+          done
 
-          echo "===== P4) fatal/exit signatures across whole log ====="
-          grep -inE "Traceback|FATAL|CRITICAL|signal|SIGTERM|SIGINT|SIGKILL|KeyboardInterrupt|SystemExit|MemoryError|OOM|shutting down|shutdown|Cancelled|cancel|exit|429|RESOURCE_EXHAUSTED|503|UNAVAILABLE|Telegram (error|API)|ReadTimeout|ConnectError" "$LOG" 2>/dev/null | grep -viE "check_fn|vulnerable|lifecycle_ledger" | tail -45 | cut -c1-210
+          echo "===== S4) read_prior_exit_label semantics ====="
+          grep -n -B3 -A25 "def read_prior_exit_label" "$SRC/gateway/lifecycle_ledger.py" 2>/dev/null | head -45 | cut -c1-190
 
-          echo "===== P5) FINAL 120 log lines ====="
-          tail -120 "$LOG" 2>/dev/null | cut -c1-220
+          echo "===== S5) what kills a gateway life per ledger (classifications) ====="
+          grep -nE "UNCLEAN|SIGKILL|OOM|VM death|clean|exit_path" "$SRC/gateway/lifecycle_ledger.py" 2>/dev/null | head -12 | cut -c1-190
 
-          echo "===== P6) request dumps (names/timestamps only, contents NOT read) ====="
-          ls -la "$H/sessions/" 2>/dev/null | grep -i request_dump | tail -10 | awk '{print $NF, $5"B", $(NF-1)}' | cut -c1-120
-
-          echo "===== P7) lifecycle ledger (read-only sqlite) ====="
-          grep -rn "lifecycle_ledger\|life_ledger\|gateway_lives\|lives.db" "$SRC/hermes_cli" 2>/dev/null | grep -v test | head -8 | sed "s|$SRC|<src>|" | cut -c1-170
-          python3 - <<'PY'
-          import sqlite3, glob, os
-          cands=[]
-          for pat in (os.path.expanduser("~/.hermes/**/*.db"),):
-              cands+=glob.glob(pat, recursive=True)
-          shown=0
-          for db in cands:
-              try:
-                  con=sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-                  tables=[r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
-                  cand=[t for t in tables if any(k in t.lower() for k in ("life","ledger","gateway"))]
-                  if cand:
-                      print(f"DB {db} tables={tables}")
-                      for t in cand:
-                          try:
-                              rows=con.execute(f"SELECT * FROM {t} ORDER BY rowid DESC LIMIT 5").fetchall()
-                              cols=[c[1] for c in con.execute(f"PRAGMA table_info({t})")]
-                              print(f"  table {t} cols={cols}")
-                              for r in rows: print("   ", str(r)[:200])
-                              shown+=1
-                          except Exception as e: print("   row read err:", e)
-                  con.close()
-              except Exception: pass
-          if not shown: print("no ledger tables found via glob; ledger source lines above give hints")
-          PY
-
-          echo "===== P8) supervisor/restart audit ====="
-          (systemctl --user list-units 2>&1 | grep -i hermes | head -5) || echo "no user systemd hermes units"
-          (tmux ls 2>&1 | head -3) || echo "no tmux"
-          (crontab -l 2>&1 | grep -v "^#" | head -5) || echo "no crontab entries"
-          pgrep -af "supervisord|watchdog" | grep -vi pgrep | head -3 || echo "no supervisor processes"
-
-          echo "===== P9) conversation_loop exception-handling evidence (source) ====="
-          grep -nE "except .*(GeminiAPIError|ProviderError|Exception)" "$SRC/hermes_cli/agent/conversation_loop.py" 2>/dev/null | head -12 | sed "s|$SRC|<src>|" | cut -c1-170
-
-          echo "===== P10) /reset semantics (installed docs) ====="
-          grep -n -A4 "`/reset`\|/reset" "$SRC/website/docs/reference/slash-commands.md" 2>/dev/null | head -20 | cut -c1-170
-
-          echo "===== P11) resource snapshot ====="
-          free -m | head -3
-          df -h /tmp /home 2>/dev/null | head -4
-          echo "PM_DONE"
+          echo "SENTINEL_DONE"
           REMOTE
