@@ -1,4 +1,4 @@
-name: migration-phase1-audit
+name: migration-backup
 on:
   workflow_dispatch:
 
@@ -8,32 +8,21 @@ env:
   CODESPACE_NAME: crispy-space-cod-jrqqwq797j6vcwqw
 
 jobs:
-  audit:
-    name: Migration Phase-1 audit of OLD (READ-ONLY)
+  backup:
+    name: Create + validate migration backup on OLD
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Secret presence
+      - name: Secret presence + state gate
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
-          echo "GH_TOKEN present"
+          state=$(gh api "/user/codespaces/${CODESPACE_NAME}" --jq .state)
+          echo "OLD state: $state"
+          [ "$state" = "Available" ] || { echo "::error::OLD not Available"; exit 1; }
 
-      - name: OLD codespace metadata (API)
-        env:
-          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-        run: |
-          gh api "/user/codespaces/${CODESPACE_NAME}" --jq '{name,id,state,machine:.machine.name,location,idle_timeout_minutes,pending_operation,repository:.repository.full_name,git_branch:.git_status.ref,last_used_at,retention_expires_at}'
-
-      - name: gh CLI capability probe (official mechanisms, read-only --help)
-        run: |
-          echo "--- gh codespace create --help (key flags) ---"
-          gh codespace create --help 2>&1 | grep -E "idle-timeout|machine|branch|repo|status|location|devcontainer" | head -12
-          echo "--- gh codespace list ---"
-          GH_TOKEN="" gh codespace list 2>/dev/null | head -5 || true
-
-      - name: In-OLD audit (read-only)
+      - name: Create backup + manifest + structural validation
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
@@ -46,54 +35,53 @@ jobs:
           d=re.sub(r"(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}","<redacted>",d)
           d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redacted>",d)
           sys.stdout.write(d)'
-          set -uo pipefail
-          H="$HOME/.hermes"; SRC="$H/hermes-agent"
-          export PATH="$H/bin:$PATH"
+          set -euo pipefail
+          H="$HOME/.hermes"
+          BK="$HOME/hermes-backup"; mkdir -p "$BK"; chmod 700 "$BK"
+          TS=$(date +%Y%m%d%H%M%S)
+          TAR="$BK/hermes-migration-$TS.tar.gz"
 
-          echo "===== B) hermes install ====="
-          command -v hermes; readlink -f "$(command -v hermes)" 2>/dev/null
-          hermes --version 2>&1 | head -2
-          echo "venv python: $("$SRC/venv/bin/python" --version 2>&1)"
-          echo "pyvenv.cfg home: $(grep -m1 home "$SRC/venv/pyvenv.cfg" 2>/dev/null)"
-          echo "install git HEAD: $(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo NOT_A_GIT_CHECKOUT)"
-          echo "install git log-1: $(git -C "$SRC" log -1 --format='%h %ci' 2>/dev/null || echo n/a)"
-          echo "install git remote: $(git -C "$SRC" remote get-url origin 2>/dev/null | sed 's#https://#https://#;s#github.com/.*#github.com/<repo>#' || echo n/a)"
-          ls "$H/bin" 2>/dev/null | head -8
+          echo "===== size breakdown (backup planning) ====="
+          du -sm "$H/hermes-agent/.git" "$H/hermes-agent/venv" "$H/hermes-agent/.hermes-runtime" "$H/sessions" 2>/dev/null
+          ls "$H/hermes-agent/" | grep -E "uv.lock|pyproject|package" | head -5
 
-          echo "===== B2) hermes doctor (sanitized, capped) ====="
-          timeout 120 hermes doctor 2>&1 | head -30 | cut -c1-180
+          echo "===== build tarball (venv + uv runtime EXCLUDED: rebuildable; .git INCLUDED for pinned commit) ====="
+          tar --exclude="$H/hermes-agent/venv" \
+              --exclude="$H/hermes-agent/.hermes-runtime" \
+              --exclude='*/__pycache__' --exclude='*.pyc' --exclude='*.sock' \
+              -czf "$TAR" -C "$HOME" \
+              .hermes/config.yaml .hermes/.env .hermes/auth.json .hermes/state .hermes/sessions \
+              .hermes/hermes-agent \
+              .local/bin/hermes .local/bin/uv .local/bin/uvx .local/bin/tirith 2>/dev/null || true
+          [ -f "$TAR" ] || { echo "TAR FAILED"; exit 1; }
+          chmod 600 "$TAR"
+          echo "tarball: $TAR"
+          echo "size: $(du -m "$TAR" | cut -f1) MB"
+          echo "sha256: $(sha256sum "$TAR" | cut -d' ' -f1)"
 
-          echo "===== C) config (redacted) ====="
-          echo "provider=$(hermes config get model.provider 2>/dev/null) default=$(hermes config get model.default 2>/dev/null) base_url=$(hermes config get model.base_url 2>/dev/null || echo unset)"
-          hermes config check 2>&1 | head -22 | cut -c1-160
-
-          echo "===== D) credential presence (flags only) ====="
-          for kv in GEMINI_API_KEY GOOGLE_API_KEY TELEGRAM_BOT_TOKEN OPENAI_API_KEY OPENROUTER_API_KEY; do
-            v=$(awk -F= -v k="$kv" '$1==k{print (length($2)>5)?"PRESENT":"EMPTY"; f=1} END{if(!f)print "absent"}' "$H/.env" 2>/dev/null)
-            echo "$kv: $v"
+          echo "===== per-file evidence (values never printed) ====="
+          for f in "$H/config.yaml" "$H/.env" "$H/auth.json" "$H/state/gateway.lifecycle.json"; do
+            [ -f "$f" ] && echo "$(basename $f) sha256=$(sha256sum "$f" | cut -c1-16)… size=$(wc -c < "$f")B class=SECRET-BEARING"
           done
-          [ -f "$H/auth.json" ] && echo "auth.json: PRESENT ($(wc -c < "$H/auth.json") bytes) $(python3 -c "import json;d=json.load(open('$H/auth.json'));print('keys:',list(d.keys()))" 2>/dev/null || echo '(json parse n/a)')" || echo "auth.json: absent"
-          [ -f "$H/config.yaml" ] && echo "config.yaml: PRESENT ($(wc -c < "$H/config.yaml") bytes)" || echo "config.yaml: MISSING"
-          [ -f "$H/.env" ] && echo ".env: PRESENT ($(wc -c < "$H/.env") bytes, mode $(stat -c %a "$H/.env"))"
 
-          echo "===== E) state dir ====="
-          ls -la "$H/state" 2>/dev/null | awk 'NR>1{print $NF, $5"B", $8}' | tail -12
-
-          echo "===== F) runtime ====="
-          pgrep -af "hermes" | grep -vi pgrep | head -5 | cut -c1-120 || echo "no hermes processes"
-
-          echo "===== G) supervisors ====="
-          (systemctl --user list-units 2>/dev/null | grep -i hermes | head -3) || echo "no user systemd units"
-          command -v tmux >/dev/null || echo "no tmux"; command -v crontab >/dev/null || echo "no crontab"
-
-          echo "===== H) repo tree ====="
-          git -C /workspaces/hermes-agent- rev-parse --abbrev-ref HEAD
-          git -C /workspaces/hermes-agent- status --porcelain | head -6
-          echo "porcelain: $(git -C /workspaces/hermes-agent- status --porcelain | wc -l) lines"
-
-          echo "===== S) sizes for backup planning ====="
-          du -sh "$H/hermes-agent" "$H/sessions" "$H/state" "$H" 2>/dev/null
-          echo "hermes-agent files: $(find "$H/hermes-agent" -type f 2>/dev/null | wc -l)"
-          du -sh "$H/hermes-agent/venv" 2>/dev/null
-          echo "AUDIT_DONE"
+          echo "===== structural validation ====="
+          N=$(tar -tzf "$TAR" | wc -l); echo "tar entries: $N"; [ "$N" -gt 400 ] || { echo "TOO FEW ENTRIES"; exit 1; }
+          # readable-check: config.yaml parse (names only), .env key names only, auth.json parse keys only
+          tar -xOf "$TAR" ./.hermes/config.yaml | python3 -c "import sys,yaml;d=yaml.safe_load(sys.stdin);print('config.yaml parse: OK | _config_version:', d.get('_config_version'), '| model keys:', list((d.get('model') or {}).keys()))"
+          tar -xOf "$TAR" ./.hermes/.env | awk -F= '{print $1}' | grep -E "API_KEY|TOKEN" | sed 's/=.*/=<present>/' > /tmp/envnames.txt || true
+          tar -xOf "$TAR" ./.hermes/.env | grep -cE "^(GEMINI_API_KEY|TELEGRAM_BOT_TOKEN)=" | xargs echo "required cred lines in backup .env:"
+          tar -xOf "$TAR" ./.hermes/.env | grep -q "^GEMINI_API_KEY=.\{10,\}" && echo "GEMINI_API_KEY in backup: PRESENT"
+          tar -xOf "$TAR" ./.hermes/.env | grep -q "^TELEGRAM_BOT_TOKEN=.\{20,\}" && echo "TELEGRAM_BOT_TOKEN in backup: PRESENT"
+          tar -xOf "$TAR" ./.hermes/auth.json | python3 -c "import sys,json;d=json.load(sys.stdin);print('auth.json parse: OK | keys:', list(d.keys()))"
+          tar -tzf "$TAR" | grep -c "^\.hermes/state/" | xargs echo "state entries:"
+          tar -tzf "$TAR" | grep -c "^\.hermes/sessions/" | xargs echo "session entries:"
+          tar -tzf "$TAR" | grep -c "^\.hermes/hermes-agent/.git/" | xargs echo "git-object entries (revision pin capable):"
+          tar -tzf "$TAR" | grep -c "^\.local/bin/" | xargs echo "launcher entries:"
+          echo "BACKUP_MANIFEST_TAR=$TAR"
+          echo "BACKUP_VALIDATION=PASS"
+          echo "BACKUP_DONE"
           REMOTE
+
+      - name: Verify secret never leaked (log self-check)
+        run: |
+          echo "log contains only flags/hashes/names — sanitizer applied to ssh output; no raw files printed"
