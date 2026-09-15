@@ -1,4 +1,4 @@
-name: telegram-failure-diagnosis
+name: gateway-postmortem
 on:
   workflow_dispatch:
 
@@ -6,8 +6,8 @@ permissions:
   contents: read
 
 jobs:
-  diagnosis:
-    name: READ-ONLY diagnosis of gemini-3.6-flash failure
+  postmortem:
+    name: READ-ONLY gateway post-mortem
     runs-on: ubuntu-latest
     env:
       CODESPACE_NAME: crispy-space-cod-jrqqwq797j6vcwqw
@@ -20,9 +20,9 @@ jobs:
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
           state=$(gh api "/user/codespaces/${CODESPACE_NAME}" --jq .state)
           echo "codespace state: $state"
-          [ "$state" = "Available" ] || { echo "::error::Not Available; NO start performed (policy)"; exit 1; }
+          [ "$state" = "Available" ] || { echo "::error::Not Available; abort"; exit 1; }
 
-      - name: Inspect gateway log (read-only) + one catalog GET
+      - name: Collect post-mortem evidence (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
@@ -32,52 +32,77 @@ jobs:
           d=sys.stdin.buffer.read().decode("utf-8","replace")
           d=re.sub(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}","<tg-token>",d)
           d=re.sub(r"chat_id[\" ]*[:=][\" ]*[0-9]{5,}","chat_id=<id>",d)
-          d=re.sub(r"chat/[0-9]{5,}","chat/<id>",d)
           d=re.sub(r"(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}","<redacted>",d)
           d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redacted>",d)
           sys.stdout.write(d)'
           set -uo pipefail
-          H="$HOME/.hermes"
+          H="$HOME/.hermes"; SRC="$H/hermes-agent"
           export PATH="$H/bin:$PATH"
           LOG=/tmp/hermes-gateway.log
 
-          echo "===== G1) gateway state ====="
-          [ -f "$LOG" ] && echo "log: $(wc -l < "$LOG") lines, mtime $(stat -c %y "$LOG" 2>/dev/null | cut -d. -f1)" || echo "log MISSING"
-          pgrep -af "hermes" | grep -vi pgrep | grep -i gateway | head -3 | cut -c1-120 || echo "gateway process: NOT RUNNING"
+          echo "===== P1) process state now ====="
+          pgrep -af "hermes" | grep -vi pgrep | head -5 | cut -c1-120 || echo "no hermes process running (expected: VM was stopped)"
+          date -u '+codespace clock now (UTC): %Y-%m-%dT%H:%M:%S'
 
-          echo "===== G2) HTTP status/error lines (sanitized) ====="
-          grep -inE "HTTP [0-9]{3}|status[ :=]+[0-9]{3}|429|404|401|403|500|502|503|Overloaded|ResourceExhausted|rate.?limit|quota|INVALID_ARGUMENT|NOT_FOUND|UNAVAILABLE|failed after retries|retry" "$LOG" 2>/dev/null | tail -40 | cut -c1-220
+          echo "===== P2) log identity ====="
+          if [ -f "$LOG" ]; then
+            echo "log lines: $(wc -l < "$LOG") | mtime: $(stat -c %y "$LOG" | cut -d. -f1) | size: $(wc -c < "$LOG") bytes"
+          else echo "LOG MISSING"; fi
 
-          echo "===== G3) all gemini-3.6-flash mentions ====="
-          grep -in "gemini-3.6" "$LOG" 2>/dev/null | tail -25 | cut -c1-220
+          echo "===== P3) last successful turns (delivery/completion markers) ====="
+          grep -inE "delivered|sendMessage|sent|✓|completed in|answer" "$LOG" 2>/dev/null | grep -viE "check_fn|unable|unavailable|failed" | tail -20 | cut -c1-200
 
-          echo "===== G4) model used per recent turn ====="
-          grep -inE "model[ :=]|switch|/model|using model|provider[ :=]|Agent turn|incoming|update_id|sendMessage" "$LOG" 2>/dev/null | tail -50 | cut -c1-200
+          echo "===== P4) fatal/exit signatures across whole log ====="
+          grep -inE "Traceback|FATAL|CRITICAL|signal|SIGTERM|SIGINT|SIGKILL|KeyboardInterrupt|SystemExit|MemoryError|OOM|shutting down|shutdown|Cancelled|cancel|exit|429|RESOURCE_EXHAUSTED|503|UNAVAILABLE|Telegram (error|API)|ReadTimeout|ConnectError" "$LOG" 2>/dev/null | grep -viE "check_fn|vulnerable|lifecycle_ledger" | tail -45 | cut -c1-210
 
-          echo "===== G5) single catalog GET (auth+catalog only, no completion) ====="
-          K=$(grep '^GEMINI_API_KEY=' "$H/.env" 2>/dev/null | head -1 | cut -d= -f2-)
-          if [ -z "$K" ]; then
-            echo "GEMINI_API_KEY: not found in .env"
-          else
-            code=$(curl -s -o /tmp/cm.json -w "%{http_code}" --max-time 30 -H "x-goog-api-key: $K" "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100")
-            echo "GET models -> HTTP $code"
-            python3 - <<'PY'
-          import json
-          try:
-              ids=[m["name"].split("/",1)[1] for m in json.load(open("/tmp/cm.json"))["models"]]
-              print("catalog size:", len(ids))
-              print("'gemini-3.6-flash' in catalog:", "gemini-3.6-flash" in ids)
-              print("gemini-3.x/flash family:", sorted(i for i in ids if "3.6" in i or "3.7" in i or "3.8" in i))
-              print("'gemini-3-flash-preview' in catalog:", "gemini-3-flash-preview" in ids)
-          except Exception as e:
-              print("catalog parse fail:", e)
+          echo "===== P5) FINAL 120 log lines ====="
+          tail -120 "$LOG" 2>/dev/null | cut -c1-220
+
+          echo "===== P6) request dumps (names/timestamps only, contents NOT read) ====="
+          ls -la "$H/sessions/" 2>/dev/null | grep -i request_dump | tail -10 | awk '{print $NF, $5"B", $(NF-1)}' | cut -c1-120
+
+          echo "===== P7) lifecycle ledger (read-only sqlite) ====="
+          grep -rn "lifecycle_ledger\|life_ledger\|gateway_lives\|lives.db" "$SRC/hermes_cli" 2>/dev/null | grep -v test | head -8 | sed "s|$SRC|<src>|" | cut -c1-170
+          python3 - <<'PY'
+          import sqlite3, glob, os
+          cands=[]
+          for pat in (os.path.expanduser("~/.hermes/**/*.db"),):
+              cands+=glob.glob(pat, recursive=True)
+          shown=0
+          for db in cands:
+              try:
+                  con=sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                  tables=[r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+                  cand=[t for t in tables if any(k in t.lower() for k in ("life","ledger","gateway"))]
+                  if cand:
+                      print(f"DB {db} tables={tables}")
+                      for t in cand:
+                          try:
+                              rows=con.execute(f"SELECT * FROM {t} ORDER BY rowid DESC LIMIT 5").fetchall()
+                              cols=[c[1] for c in con.execute(f"PRAGMA table_info({t})")]
+                              print(f"  table {t} cols={cols}")
+                              for r in rows: print("   ", str(r)[:200])
+                              shown+=1
+                          except Exception as e: print("   row read err:", e)
+                  con.close()
+              except Exception: pass
+          if not shown: print("no ledger tables found via glob; ledger source lines above give hints")
           PY
-            rm -f /tmp/cm.json
-          fi
-          unset K
 
-          echo "===== G6) config unchanged (read-only show) ====="
-          echo "model.provider = $(hermes config get model.provider 2>/dev/null)"
-          echo "model.default  = $(hermes config get model.default 2>/dev/null)"
-          echo "===== DIAG_DONE ====="
+          echo "===== P8) supervisor/restart audit ====="
+          (systemctl --user list-units 2>&1 | grep -i hermes | head -5) || echo "no user systemd hermes units"
+          (tmux ls 2>&1 | head -3) || echo "no tmux"
+          (crontab -l 2>&1 | grep -v "^#" | head -5) || echo "no crontab entries"
+          pgrep -af "supervisord|watchdog" | grep -vi pgrep | head -3 || echo "no supervisor processes"
+
+          echo "===== P9) conversation_loop exception-handling evidence (source) ====="
+          grep -nE "except .*(GeminiAPIError|ProviderError|Exception)" "$SRC/hermes_cli/agent/conversation_loop.py" 2>/dev/null | head -12 | sed "s|$SRC|<src>|" | cut -c1-170
+
+          echo "===== P10) /reset semantics (installed docs) ====="
+          grep -n -A4 "`/reset`\|/reset" "$SRC/website/docs/reference/slash-commands.md" 2>/dev/null | head -20 | cut -c1-170
+
+          echo "===== P11) resource snapshot ====="
+          free -m | head -3
+          df -h /tmp /home 2>/dev/null | head -4
+          echo "PM_DONE"
           REMOTE
