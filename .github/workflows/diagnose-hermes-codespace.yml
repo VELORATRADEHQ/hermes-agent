@@ -1,32 +1,67 @@
-name: migration-backup-final-validate
+name: migration-restore
 on:
   workflow_dispatch:
 
 permissions: {}
 
 env:
-  CODESPACE_NAME: crispy-space-cod-jrqqwq797j6vcwqw
+  OLD_CS: crispy-space-cod-jrqqwq797j6vcwqw
+  NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
 
 jobs:
-  fvalidate:
-    name: Final backup validation (no streaming grep)
+  restore:
+    name: Transfer + restore Hermes on NEW codespace
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 18
     steps:
-      - name: Gates
+      - name: Gates + NEW metadata verify
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
-          st=$(gh api "/user/codespaces/${CODESPACE_NAME}" --jq .state); echo "OLD state: $st"
-          [ "$st" = "Available" ] || { echo "::error::not Available"; exit 1; }
+          so=$(gh api "/user/codespaces/${OLD_CS}" --jq .state)
+          sn=$(gh api "/user/codespaces/${NEW_CS}" --jq '.state,.idle_timeout_minutes,.machine.name,.location,.repository.full_name,.git_status.ref' | xargs)
+          echo "OLD state: $so"; echo "NEW: $sn"
+          [ "$so" = "Available" ] || { echo "::error::OLD not Available"; exit 1; }
+          case "$sn" in Available*) ;; *) echo "::error::NEW not Available: $sn"; exit 1;; esac
+          echo "$sn" | grep -q " 240 " || echo "WARNING: idle field check inconclusive"
+          gh api "/user/codespaces/${NEW_CS}" --jq '.idle_timeout_minutes' > /tmp/idle.txt
+          IDLE=$(cat /tmp/idle.txt); echo "NEW idle_timeout_minutes=$IDLE"
+          [ "$IDLE" = "240" ] || { echo "::error::STOP GATE: NEW idle_timeout is $IDLE, expected 240"; exit 1; }
 
-      - name: Validate both archives (listing-to-file method)
+      - name: Transfer critical backup OLD -> runner (600, tmpfs)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
-          set -uo pipefail
-          gh codespace ssh --codespace "$CODESPACE_NAME" -- bash -s <<'REMOTE' 2>&1 | python3 -c '
+          set -euo pipefail
+          umask 077
+          gh codespace cp -c "$OLD_CS" "remote:/home/codespace/hermes-backup/migration-critical-1789516065.tar.gz" /tmp/mc.tar.gz
+          gh codespace cp -c "$OLD_CS" "remote:/home/codespace/hermes-backup/migration-state-1789516065.tar.gz" /tmp/ms.tar.gz
+          echo "runner copies:"
+          ls -la /tmp/mc.tar.gz /tmp/ms.tar.gz | awk '{print $NF, $5"B"}'
+          echo "critical sha256: $(sha256sum /tmp/mc.tar.gz | cut -c1-32)… (expect 58daef54d7dfe8d1e9cb54e3fbf09c5c…)"
+          sha256sum /tmp/mc.tar.gz | grep -q "^58daef54d7dfe8d1e9cb54e3fbf09c5c" && echo "INTEGRITY: critical OK" || { echo "::error::integrity mismatch"; exit 1; }
+          sha256sum /tmp/ms.tar.gz | grep -q "^89288f5fdadea78337258e40ec37fe37" && echo "INTEGRITY: state OK" || echo "note: state snapshot changed (volatile, acceptable)"
+
+      - name: Get origin URL from OLD (public, non-secret)
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+        run: |
+          gh codespace ssh --codespace "$OLD_CS" -- git -C /home/codespace/.hermes/hermes-agent remote get-url origin > /tmp/origin.txt
+          cat /tmp/origin.txt
+
+      - name: Transfer runner -> NEW + restore + verify environment
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+          ORIGIN_URL: dummy-will-not-work
+        run: |
+          set -euo pipefail
+          ORIG=$(cat /tmp/origin.txt)
+          echo "origin url: $ORIG"
+          umask 077
+          gh codespace cp -c "$NEW_CS" /tmp/mc.tar.gz remote:/tmp/mc.tar.gz
+          gh codespace cp -c "$NEW_CS" /tmp/ms.tar.gz remote:/tmp/ms.tar.gz
+          gh codespace ssh --codespace "$NEW_CS" -- ORIGIN="$ORIG" bash -s <<'REMOTE' 2>&1 | python3 -c '
           import sys,re
           d=sys.stdin.buffer.read().decode("utf-8","replace")
           d=re.sub(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}","<tg-token>",d)
@@ -35,38 +70,81 @@ jobs:
           d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redacted>",d)
           sys.stdout.write(d)'
           set -euo pipefail
-          BK="$HOME/hermes-backup"
-          C=$(ls -t "$BK"/migration-critical-*.tar.gz | head -1)
-          S=$(ls -t "$BK"/migration-state-*.tar.gz | head -1)
-          T="$BK/hermes-migration-20260915233438.tar.gz"
-          echo "artifacts:"
-          ls -la "$BK" | awk 'NR>1{print " ", $NF, $5"B"}' | grep -v "^\s*$"
+          echo "===== E1) new env inspect ====="
+          whoami; uname -m; python3 --version 2>/dev/null || echo "no python3"
+          command -v git; command -v curl | head -1
+          ls -ld "$HOME/.hermes" 2>/dev/null || echo "~/.hermes: absent (virgin) ✓"
 
-          echo "===== critical archive checks ====="
-          tar -tzf "$C" > /tmp/lc.txt
-          for m in .hermes/config.yaml .hermes/.env .hermes/auth.json .local/bin/hermes .local/bin/uv; do
-            grep -qF "$m" /tmp/lc.txt && echo "$m: PRESENT" || { echo "$m: MISSING"; exit 1; }
-          done
-          echo "entries: $(wc -l < /tmp/lc.txt)"
-          tar -xOf "$C" .hermes/config.yaml | python3 -c "import sys,yaml;d=yaml.safe_load(sys.stdin);print('config.yaml parse OK | version:', d.get('_config_version'), '| model:', d.get('model'))"
-          tar -xOf "$C" .hermes/.env | grep -q "^GEMINI_API_KEY=.\{10,\}" && echo "GEMINI_API_KEY: PRESENT(len)"
-          tar -xOf "$C" .hermes/.env | grep -q "^TELEGRAM_BOT_TOKEN=.\{20,\}" && echo "TELEGRAM_BOT_TOKEN: PRESENT(len)"
-          tar -xOf "$C" .hermes/auth.json | python3 -c "import sys,json;d=json.load(sys.stdin);print('auth.json parse OK keys:', list(d.keys()))"
-          echo "sessions entries: $(grep -c 'hermes/sessions/' /tmp/lc.txt)"
+          echo "===== E2) extract critical backup ====="
+          mkdir -p "$HOME/.hermes/state"
+          tar -xzf /tmp/mc.tar.gz -C "$HOME"
+          tar -xzf /tmp/ms.tar.gz -C /tmp
+          SNAP=$(ls -d /tmp/state-snap-* 2>/dev/null | head -1)
+          [ -n "$SNAP" ] && cp -a "$SNAP"/. "$HOME/.hermes/state/" && rm -rf "$SNAP"
+          chmod 600 "$HOME/.hermes/.env" "$HOME/.hermes/auth.json"
+          chmod 700 "$HOME/.hermes" "$HOME/.hermes/state"
+          echo "extracted. .env mode=$(stat -c %a "$HOME/.hermes/.env"), auth.json mode=$(stat -c %a "$HOME/.hermes/auth.json")"
+          shred -u /tmp/mc.tar.gz /tmp/ms.tar.gz 2>/dev/null || rm -f /tmp/mc.tar.gz /tmp/ms.tar.gz
 
-          echo "===== state snapshot archive checks ====="
-          tar -tzf "$S" > /tmp/ls.txt
-          grep -c "gateway.lifecycle.json\|gateway.heartbeat" /tmp/ls.txt | xargs echo "state key files:"
+          echo "===== E3) install uv (official) ====="
+          curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh >/tmp/uvinst.log 2>&1 || { echo "uv install failed"; tail -5 /tmp/uvinst.log; exit 1; }
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          command -v uv; uv --version
 
-          echo "===== big source archive checks ====="
-          tar -tzf "$T" > /tmp/lb.txt
-          echo "entries: $(wc -l < /tmp/lb.txt)"
-          for m in .hermes/config.yaml .hermes/hermes-agent/uv.lock .hermes/hermes-agent/pyproject.toml; do
-            grep -qF "$m" /tmp/lb.txt && echo "$m: PRESENT" || echo "$m: absent"
-          done
-          echo ".git members: $(grep -c 'hermes-agent/.git/' /tmp/lb.txt)"
-          echo "cli key file: $(grep -c 'hermes_cli/cli_model_switch_mixin.py' /tmp/lb.txt)"
-          grep -qF "hermes-agent/.git/refs" /tmp/lb.txt && echo "git refs present (commit 5d593660 pin-reproducible offline)"
-          echo "FINAL_VALIDATION=PASS"
-          echo "VALIDATION_DONE"
+          echo "===== E4) clone source @ pinned commit ====="
+          ls "$ORIGIN" >/dev/null 2>&1 || true
+          git clone --quiet "$ORIGIN" "$HOME/.hermes/hermes-agent" 2>/tmp/cloneerr || { echo "clone FAILED"; head -5 /tmp/cloneerr; exit 1; }
+          git -C "$HOME/.hermes/hermes-agent" checkout -q 5d59366010640c1d6b8f170d8a4ee109db2bbdef || { echo "PIN CHECKOUT FAILED"; exit 1; }
+          echo "checked out: $(git -C "$HOME/.hermes/hermes-agent" rev-parse HEAD)"
+
+          echo "===== E5) rebuild venv (uv sync, locked) ====="
+          cd "$HOME/.hermes/hermes-agent"
+          uv sync --locked >/tmp/uvsync.log 2>&1 || { echo "uv sync FAILED"; tail -12 /tmp/uvsync.log | cut -c1-180; exit 1; }
+          echo "venv python: $(.venv/bin/python --version 2>/dev/null || venv/bin/python --version 2>/dev/null || echo '?')"
+
+          echo "===== E6) launcher check ====="
+          if [ -x "$HOME/.local/bin/hermes" ]; then
+            echo "restored shim present"; head -c 200 "$HOME/.local/bin/hermes" 2>/dev/null | head -3 | cut -c1-160 || true
+          fi
+          export PATH="$HOME/.local/bin:$PATH"
+          if ! command -v hermes >/dev/null 2>&1; then
+            echo "no hermes on PATH — attempting uv tool install from local source"
+            uv tool install "$HOME/.hermes/hermes-agent" >/tmp/uvtool.log 2>&1 || { echo "uv tool install FAILED"; tail -8 /tmp/uvtool.log | cut -c1-180; exit 1; }
+          fi
+          command -v hermes
+          hermes --version 2>&1 | head -2
+
+          echo "===== E7) credential + config verification (flags only) ====="
+          echo "GEMINI_API_KEY: $(awk -F= '$1=="GEMINI_API_KEY"{print (length($2)>5)?"PRESENT":"EMPTY"}' "$HOME/.hermes/.env")"
+          echo "TELEGRAM_BOT_TOKEN: $(awk -F= '$1=="TELEGRAM_BOT_TOKEN"{print (length($2)>20)?"PRESENT":"EMPTY"}' "$HOME/.hermes/.env")"
+          echo "provider=$(hermes config get model.provider 2>/dev/null) default=$(hermes config get model.default 2>/dev/null) base_url=$(hermes config get model.base_url 2>/dev/null || echo unset)"
+          hermes config check 2>&1 | grep -E "GEMINI|GOOGLE|✓|✗" | head -6
+
+          echo "===== E8) doctor ====="
+          timeout 120 hermes doctor 2>&1 | grep -E "✓|✗|✘|Error" | head -20
+
+          echo "===== E9) REAL Gemini request (Phase 9) ====="
+          timeout 150 hermes -z "Reply with exactly: pong" </dev/null >/tmp/req.out 2>&1; rc=$?
+          echo "hermes -z rc=$rc"
+          tail -c 300 /tmp/req.out
+          if [ $rc -ne 0 ] || ! grep -qi pong /tmp/req.out; then
+            echo "retry --safe-mode:"
+            timeout 150 hermes --safe-mode -z "Reply with exactly: pong" </dev/null >/tmp/req.out 2>&1; rc=$?
+            echo "rc=$rc"; tail -c 300 /tmp/req.out
+          fi
+          if [ $rc -eq 0 ] && grep -qi pong /tmp/req.out; then
+            echo "REAL_REQUEST=PASS"
+            echo "RESTORE_RESULT=OK"
+          else
+            echo "REAL_REQUEST=FAIL"
+            echo "RESTORE_RESULT=NOT_READY"
+            exit 1
+          fi
+          rm -f /tmp/req.out
           REMOTE
+
+      - name: Cleanup runner copies (always)
+        if: always()
+        run: |
+          shred -u /tmp/mc.tar.gz /tmp/ms.tar.gz /tmp/origin.txt /tmp/idle.txt 2>/dev/null || true
+          echo "runner transient copies shredded"
