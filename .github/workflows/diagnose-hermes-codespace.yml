@@ -1,0 +1,146 @@
+name: Diagnose Hermes Codespace (read-only)
+
+# DIAGNOSTIC-ONLY.
+# Answers: (1) can a runner SSH into the existing Codespace via gh CLI,
+# and (2) why is Hermes off. No installs, no restarts, no modifications
+# of Hermes, configs, .env, secrets, or Codespace lifecycle.
+# The credential is used only via the Actions secret reference and never printed.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: diagnose-hermes-codespace
+  cancel-in-progress: false
+
+env:
+  CODESPACE_NAME: "crispy-space-cod-jrqqwq797j6vcwqw"
+
+jobs:
+  diagnose:
+    name: SSH capability probe + read-only Hermes diagnosis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify credential availability (value never printed)
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::GH_TOKEN is missing - secret CODESPACE_LIFECYCLE_PAT is not configured."
+            exit 1
+          fi
+          echo "GH_TOKEN is present"
+
+      - name: Tooling + Codespace state via API
+        id: precheck
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+        run: |
+          gh --version
+          state=$(gh api "/user/codespaces/${CODESPACE_NAME}" --jq .state 2>err.txt) || {
+            echo "::error::Codespaces API query failed: $(head -c 200 err.txt)"
+            rm -f err.txt
+            exit 1
+          }
+          rm -f err.txt
+          echo "Codespace state: ${state}"
+          echo "state=${state}" >> "$GITHUB_OUTPUT"
+
+      - name: Probe gh codespace ssh capability
+        id: sshcheck
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+          STATE: ${{ steps.precheck.outputs.state }}
+        run: |
+          if [ "$STATE" != "Available" ]; then
+            echo "Codespace state is '$STATE' (not Available)."
+            echo "gh codespace ssh requires a RUNNING codespace."
+            echo "Per diagnostic-only policy, NO start/restart is performed here."
+            echo "ssh=skipped-stopped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if out=$(gh codespace ssh --codespace "$CODESPACE_NAME" -- sh -c 'echo SSH_OK; hostname; whoami' 2>ssh_err.txt); then
+            echo "$out"
+            echo "ssh=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "gh codespace ssh FAILED:"
+            head -c 400 ssh_err.txt
+            echo "ssh=failed" >> "$GITHUB_OUTPUT"
+          fi
+          rm -f ssh_err.txt
+
+      - name: Read-only diagnostics INSIDE the Codespace
+        if: steps.sshcheck.outputs.ssh == 'ok'
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+        run: |
+          gh codespace ssh --codespace "$CODESPACE_NAME" -- bash -s <<'REMOTE'
+          set +e
+          redact() {
+            sed -E \
+              -e 's/[0-9]{8,10}:[A-Za-z0-9_-]{30,}/<TG_TOKEN_REDACTED>/g' \
+              -e 's/(github_pat_|ghp_)[A-Za-z0-9_]+/<GH_TOKEN_REDACTED>/g' \
+              -e 's/sk-[A-Za-z0-9_-]{20,}/<API_KEY_REDACTED>/g' \
+              -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1<REDACTED>/g'
+          }
+
+          echo "### SECTION: identity"
+          pwd; whoami; uname -a; date
+          python3 --version 2>&1
+          git --version
+
+          echo "### SECTION: hermes-installation"
+          echo "HERMES_HOME=${HERMES_HOME:-<unset>}"
+          command -v hermes || echo "hermes: NOT in PATH"
+          if [ -d "$HOME/.hermes" ]; then
+            echo "~/.hermes exists:"
+            ls -la "$HOME/.hermes" | head -25
+          else
+            echo "~/.hermes: NOT FOUND (Hermes likely never installed)"
+          fi
+          HBIN="$(command -v hermes || echo "$HOME/.local/bin/hermes")"
+          if [ -x "$HBIN" ]; then
+            echo "candidate binary: $HBIN"
+            "$HBIN" --version 2>&1 | head -3
+          else
+            echo "no executable hermes binary found"
+          fi
+
+          echo "### SECTION: processes"
+          pgrep -af hermes || echo "no hermes process running"
+          pgrep -afi 'telegram|gateway' | grep -v pgrep || echo "no telegram/gateway process running"
+
+          echo "### SECTION: services"
+          systemctl --user is-system-running 2>&1 | head -1
+          systemctl --user list-units --type=service --all --no-pager 2>&1 | grep -i hermes | head -5 || echo "no hermes user service"
+          systemctl list-units --type=service --all --no-pager 2>&1 | grep -i hermes | head -5 || echo "no hermes system service"
+
+          echo "### SECTION: supervisors"
+          tmux ls 2>&1 | head -5
+          screen -ls 2>&1 | head -5
+
+          echo "### SECTION: gateway-config (existence only - values never read)"
+          if [ -f "$HOME/.hermes/.env" ]; then
+            echo ".env: exists"
+            grep -q TELEGRAM_BOT_TOKEN "$HOME/.hermes/.env" && echo "TELEGRAM_BOT_TOKEN entry: present (value never shown)" || echo "TELEGRAM_BOT_TOKEN entry: ABSENT"
+          else
+            echo ".env: MISSING (gateway never configured)"
+          fi
+
+          echo "### SECTION: logs (metadata + redacted error lines only)"
+          if [ -d "$HOME/.hermes/logs" ]; then
+            ls -lat "$HOME/.hermes/logs" | head -12
+            latest=$(ls -t "$HOME/.hermes/logs/"*.log 2>/dev/null | head -1)
+            if [ -n "$latest" ]; then
+              echo "latest log: $(basename "$latest") | modified: $(stat -c %y "$latest" 2>/dev/null || date -r "$latest")"
+              echo "--- redacted error-pattern excerpt (last matches) ---"
+              tail -n 80 "$latest" | grep -aiE 'error|exception|traceback|failed|refus|unauthor|401|403|timeout' | redact | tail -n 25 || echo "no error-pattern lines in tail"
+            fi
+          else
+            echo "no ~/.hermes/logs directory"
+          fi
+          echo "### END DIAGNOSTIC"
+          REMOTE
