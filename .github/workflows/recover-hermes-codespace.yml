@@ -1,0 +1,77 @@
+name: Recover Hermes Codespace (PoC)
+
+# Minimal proof-of-concept only:
+#   GitHub Actions -> shell -> Actions secret -> GitHub Codespaces API
+# Manual trigger only. No schedule. No checkout. Start-only logic.
+# The credential is provided exclusively via the repository Actions secret
+# reference and is never printed.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: recover-hermes-codespace
+  cancel-in-progress: false
+
+env:
+  CODESPACE_NAME: "crispy-space-cod-jrqqwq797j6vcwqw"
+
+jobs:
+  poc:
+    name: Actions -> shell -> secret -> Codespaces API
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Print safe environment information
+        run: |
+          pwd
+          whoami
+          uname -a
+          python --version 2>/dev/null || python3 --version
+          git --version
+          gh --version
+
+      - name: Verify secret availability (value is never printed)
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+        run: |
+          if [ -n "${GH_TOKEN:-}" ]; then
+            echo "GH_TOKEN is present"
+          else
+            echo "::error::GH_TOKEN is missing - repository secret CODESPACE_LIFECYCLE_PAT is not configured."
+            exit 1
+          fi
+
+      - name: Query current Codespace state
+        id: state
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+        run: |
+          if ! gh api "/user/codespaces/${CODESPACE_NAME}" --jq .state > cs_state.txt 2> cs_err.txt; then
+            echo "::error::Codespaces API GET failed: $(head -c 300 cs_err.txt)"
+            rm -f cs_state.txt cs_err.txt
+            exit 1
+          fi
+          state=$(cat cs_state.txt)
+          rm -f cs_state.txt cs_err.txt
+          echo "Codespace state: ${state}"
+          echo "state=${state}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide and act (start only when Shutdown/Stopped)
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+          STATE: ${{ steps.state.outputs.state }}
+        run: |
+          case "$STATE" in
+            Available|Starting|Rebuilding|Updating|Updated|Queued|Provisioning|Awaiting|Created)
+              echo "State '${STATE}' is running or transitioning - no action taken." ;;
+            Shutdown|Stopped)
+              echo "State '${STATE}' - requesting start via official Codespaces API."
+              gh api -X POST "/user/codespaces/${CODESPACE_NAME}/start" --jq .state
+              echo "Start request completed." ;;
+            *)
+              echo "::error::Unexpected Codespace state '${STATE}'. Failing clearly; inspect manually."
+              exit 1 ;;
+          esac
