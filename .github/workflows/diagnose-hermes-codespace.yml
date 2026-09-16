@@ -1,27 +1,63 @@
-name: migration-phase9-retry
+name: migration-p10-p11
 on:
   workflow_dispatch:
 
 permissions: {}
 
 env:
+  OLD_CS: crispy-space-cod-jrqqwq797j6vcwqw
   NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
 
 jobs:
-  phase9:
-    name: upstream-label forensics + bounded real-request retry
+  p1011:
+    name: Telegram infra (P10) + persistence (P11)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Gate
+      - name: Gates
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
-          st=$(gh api "/user/codespaces/${NEW_CS}" --jq .state); echo "NEW state: $st"
-          [ "$st" = "Available" ] || { echo "::error::NEW not Available"; exit 1; }
+          so=$(gh api "/user/codespaces/${OLD_CS}" --jq .state); echo "OLD: $so"
+          sn=$(gh api "/user/codespaces/${NEW_CS}" --jq .state); echo "NEW: $sn"
+          [ "$so" = "Available" ] || { echo "::error::OLD not Available"; exit 1; }
+          [ "$sn" = "Available" ] || { echo "::error::NEW not Available"; exit 1; }
 
-      - name: Forensics + bounded retry
+      - name: P10a — gracefully stop OLD gateway (token exclusivity; codespace untouched)
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+        run: |
+          set -uo pipefail
+          gh codespace ssh --codespace "$OLD_CS" -- bash -s <<'REMOTE' 2>&1 | python3 -c '
+          import sys,re
+          d=sys.stdin.buffer.read().decode("utf-8","replace")
+          d=re.sub(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}","<tg-token>",d)
+          d=re.sub(r"(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}","<redacted>",d)
+          sys.stdout.write(d)'
+          set -uo pipefail
+          echo "===== OLD gateway state before ====="
+          PIDS=$(pgrep -f "hermes gateway" || true)
+          if [ -z "$PIDS" ]; then
+            echo "OLD gateway already stopped (nothing to do)"; OPID=none
+          else
+            OPID=$(echo "$PIDS" | head -1)
+            echo "OLD gateway running: pid=$OPID"
+            kill -TERM "$OPID" 2>/dev/null || true
+            for i in $(seq 1 12); do
+              kill -0 "$OPID" 2>/dev/null || { echo "OLD gateway PID $OPID stopped cleanly at poll $i"; break; }
+              sleep 2
+            done
+          fi
+          if pgrep -f "hermes gateway" >/dev/null 2>&1; then
+            echo "OLD_GATEWAY_STOP=STILL_RUNNING -> SIGKILL"
+            pgrep -f "hermes gateway" | xargs -r kill -9 2>/dev/null || true
+            sleep 2
+          fi
+          pgrep -f "hermes gateway" >/dev/null 2>&1 && { echo "OLD_GATEWAY_STOP=FAIL"; exit 1; } || echo "OLD_GATEWAY_STOP=CLEAN pid_stopped=$OPID"
+          REMOTE
+
+      - name: "P10b+c — NEW gateway (single start, connection, lifecycle, heartbeat, persistence)"
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
@@ -30,41 +66,71 @@ jobs:
           import sys,re
           d=sys.stdin.buffer.read().decode("utf-8","replace")
           d=re.sub(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}","<tg-token>",d)
+          d=re.sub(r"chat_id[\" ]*[:=][\" ]*[0-9]{5,}","chat_id=<id>",d)
           d=re.sub(r"(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}","<redacted>",d)
           d=re.sub(r"(Bearer\s+)[A-Za-z0-9._-]{10,}",r"\1<redacted>",d)
           sys.stdout.write(d)'
           set -uo pipefail
-          H="$HOME/.hermes"; SRC="$H/hermes-agent"
+          H="$HOME/.hermes"
           export PATH="$HOME/.local/bin:$PATH"
+          LOG="$H/state/hermes-gateway.log"
+          mkdir -p "$H/state"
 
-          echo "===== F1) upstream label provenance ====="
-          echo "git HEAD: $(git -C "$SRC" rev-parse HEAD 2>/dev/null)"
-          grep -rn "upstream" "$SRC/hermes_cli/version.py" 2>/dev/null | head -6 | cut -c1-170
-          grep -rln "upstream" "$SRC/hermes_cli" 2>/dev/null | head -6 | sed "s|$SRC|<src>|"
-          grep -rn "416a8177\|_UPSTREAM\|upstream_commit\|UPSTREAM_COMMIT" "$SRC/hermes_cli" 2>/dev/null | head -8 | sed "s|$SRC|<src>|" | cut -c1-170
+          echo "===== N1) telegram credential presence (flags) ====="
+          echo "TELEGRAM_BOT_TOKEN: $(awk -F= '$1=="TELEGRAM_BOT_TOKEN"{print (length($2)>20)?"PRESENT":"EMPTY"}' "$H/.env")"
+          echo "GEMINI_API_KEY: $(awk -F= '$1=="GEMINI_API_KEY"{print (length($2)>5)?"PRESENT":"EMPTY"}' "$H/.env")"
 
-          echo "===== F2) bounded real-request retry (max 3 attempts, ~75s apart) ====="
-          OK=0
-          for i in 1 2 3; do
-            echo "--- attempt $i ---"
-            timeout 150 hermes -z "Reply with exactly: pong" </dev/null >/tmp/req.out 2>&1
-            rc=$?
-            echo "rc=$rc"
-            if [ $rc -eq 0 ] && grep -qi pong /tmp/req.out && ! grep -qi "503\|UNAVAILABLE\|high demand" /tmp/req.out; then
-              echo "attempt $i: SUCCESS"
-              tail -c 200 /tmp/req.out
-              OK=1; break
-            fi
-            grep -oE "Gemini HTTP [0-9]+ \([A-Z_]+\)[^\"]*" /tmp/req.out | head -1 || tail -c 200 /tmp/req.out
-            [ $i -lt 3 ] && sleep 75
-          done
-          rm -f /tmp/req.out
-          if [ $OK -eq 1 ]; then
-            echo "REAL_REQUEST=PASS"
-            echo "PHASE9=OK"
-          else
-            echo "REAL_REQUEST=FAIL (still 503 after 3 bounded attempts)"
-            echo "PHASE9=BLOCKED_BY_GOOGLE_CAPACITY"
-            exit 1
+          echo "===== N2) duplicate detection BEFORE start ====="
+          if pgrep -f "hermes gateway" >/dev/null 2>&1; then
+            echo "PHASE10_DUPLICATE=PREEXISTING"; pgrep -af "hermes gateway" | cut -c1-120; exit 1
           fi
+          echo "no gateway running (clean)"
+
+          echo "===== N3) start single gateway (persistent log) ====="
+          OFF=0; [ -f "$LOG" ] && OFF=$(wc -c < "$LOG")
+          cd "$HOME"
+          nohup hermes gateway --accept-hooks run >> "$LOG" 2>&1 &
+          GPID=$!; echo "spawned pid=$GPID (log=$LOG)"
+          sleep 3
+          READY=0
+          for i in $(seq 1 24); do
+            kill -0 "$GPID" 2>/dev/null || { echo "process died during boot"; break; }
+            if tail -c +$((OFF+1)) "$LOG" 2>/dev/null | grep -qi "Connected to Telegram"; then READY=1; echo "Telegram connected at poll $i"; break; fi
+            sleep 5
+          done
+          [ "$READY" = "1" ] || { echo "PHASE10_GATEWAY_START=FAIL"; tail -20 "$LOG" | cut -c1-180; kill "$GPID" 2>/dev/null; exit 1; }
+          echo "PHASE10_GATEWAY_START=PASS pid=$GPID"
+
+          echo "===== N4) lifecycle + heartbeat + persistence ====="
+          sleep 40
+          echo "lifecycle.json: $(cat "$H/state/gateway.lifecycle.json" 2>/dev/null | cut -c1-170)"
+          [ -f "$H/state/gateway.heartbeat" ] && echo "heartbeat: PRESENT (mtime $(stat -c %y "$H/state/gateway.heartbeat" 2>/dev/null | cut -d. -f1))" || echo "heartbeat: not yet"
+          echo "log size: $(wc -c < "$LOG") bytes (persistent path ✓)"
+          echo "processes matching gateway: $(pgrep -f "hermes gateway" | wc -l)"
+          echo "PID_BEFORE_RESTART=$GPID"
+
+          echo "===== N5) PHASE 11: gateway restart (process only) ====="
+          kill -TERM "$GPID" 2>/dev/null || true
+          for i in $(seq 1 10); do kill -0 "$GPID" 2>/dev/null || { echo "old pid stopped at poll $i"; break; }; sleep 2; done
+          pgrep -f "hermes gateway" >/dev/null 2>&1 && { echo "PHASE11: old process did not stop"; exit 1; }
+          OFF2=$(wc -c < "$LOG")
+          nohup hermes gateway --accept-hooks run >> "$LOG" 2>&1 &
+          NP=$!; echo "restarted pid=$NP"
+          sleep 3
+          RDY=0
+          for i in $(seq 1 24); do
+            kill -0 "$NP" 2>/dev/null || break
+            if tail -c +$((OFF2+1)) "$LOG" 2>/dev/null | grep -qi "Connected to Telegram"; then RDY=1; echo "reconnected at poll $i"; break; fi
+            sleep 5
+          done
+          [ "$RDY" = "1" ] || { echo "PHASE11_RESTART=FAIL"; tail -15 "$LOG" | cut -c1-180; kill "$NP" 2>/dev/null; exit 1; }
+          echo "PID_AFTER_RESTART=$NP"
+          echo "gateway count after restart: $(pgrep -f "hermes gateway" | wc -l)"
+          S=$(cat "$H/state/gateway.lifecycle.json" 2>/dev/null | cut -c1-170)
+          echo "lifecycle after restart: $S"
+          echo "state files: $(ls "$H/state" | tr '\n' ' ')"
+          echo "config after restart: provider=$(hermes config get model.provider 2>/dev/null) default=$(hermes config get model.default 2>/dev/null)"
+          [ "$(pgrep -f "hermes gateway" | wc -l)" = "1" ] && echo "PHASE10_INFRA=PASS PHASE11_PERSISTENCE=PASS" || { echo "DUPLICATE DETECTED"; exit 1; }
+          echo "TELEGRAM_INFRA=PASS"
+          echo "TELEGRAM_GEMINI_E2E=BLOCKED_BY_GEMINI_QUOTA (not attempted — no fake success)"
           REMOTE
