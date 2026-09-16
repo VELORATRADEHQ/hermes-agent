@@ -103,7 +103,9 @@ jobs:
 
           echo "===== E5) rebuild venv (uv sync, locked) ====="
           cd "$HOME/.hermes/hermes-agent"
-          uv sync --locked >/tmp/uvsync.log 2>&1 || { echo "uv sync FAILED"; tail -12 /tmp/uvsync.log | cut -c1-180; exit 1; }
+          uv sync --locked --python 3.12 >/tmp/uvsync.log 2>&1 || { echo "uv sync FAILED"; tail -12 /tmp/uvsync.log | cut -c1-180; exit 1; }
+          ln -sfn .venv "$HOME/.hermes/hermes-agent/venv"
+          echo "layout compat: venv -> .venv symlink created"
           echo "venv python: $(.venv/bin/python --version 2>/dev/null || venv/bin/python --version 2>/dev/null || echo '?')"
 
           echo "===== E6) launcher check ====="
