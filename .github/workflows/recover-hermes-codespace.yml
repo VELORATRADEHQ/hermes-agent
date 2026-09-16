@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CODESPACE_NAME: "crispy-space-cod-jrqqwq797j6vcwqw"
+  CODESPACE_NAME: "hermes-migrated-240m-p7ppqpw9wgg7f964v"
 
 jobs:
   recover:
