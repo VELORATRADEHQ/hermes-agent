@@ -5,38 +5,38 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup ssh configs for both codespaces
+      - name: Final state audit OLD (read-only)
         env:
-          GH_TOKEN: ${{ secrets.CODESPACE_PAT }}
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           OLD_CS: crispy-space-cod-jrqqwq797j6vcwqw
-          NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
-        run: |
-          set -euo pipefail
-          gh codespace ssh --config -c "$OLD_CS" > /tmp/old_ssh.conf 2>/dev/null
-          gh codespace ssh --config -c "$NEW_CS" > /tmp/new_ssh.conf 2>/dev/null
-          echo "ssh configs ready"
-      - name: Final state audit (read-only, flags/hashes only)
         run: |
           set -uo pipefail
-          ssh -F /tmp/old_ssh.conf old.cs 'bash -s' <<'REMOTE' 2>&1
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
+          gh codespace ssh --codespace "$OLD_CS" -- bash -s <<'REMOTE' 2>&1
           echo "===== OLD codespace final ====="
           echo "gateway processes: $(ps -eo pid,args | grep -c '[h]ermes gateway' || true)"
-          echo "--- backup vault ~/hermes-backup (name size sha256-prefix) ---"
           for f in /home/codespace/hermes-backup/*.tar.gz; do
-            [ -f "$f" ] && echo "$(basename "$f") $(stat -c %s "$f") $(sha256sum "$f" | cut -c1-12)"
+            [ -f "$f" ] && echo "backup: $(basename "$f") bytes=$(stat -c %s "$f") sha256=$(sha256sum "$f" | cut -c1-12)"
           done
           REMOTE
-          ssh -F /tmp/new_ssh.conf new.cs 'bash -s' <<'REMOTE' 2>&1
+      - name: Final state audit NEW (read-only)
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+          NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
+        run: |
+          set -uo pipefail
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
+          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
           echo "===== NEW codespace final ====="
           P=$(ps -eo pid,args | grep '[h]ermes gateway' | grep -v grep | awk '{print $1}' | head -1)
-          echo "gateway pid: ${P:-NONE} (count: $(ps -eo pid,args | grep -c '[h]ermes gateway'))"
+          echo "gateway pid: ${P:-NONE} count: $(ps -eo pid,args | grep -c '[h]ermes gateway')"
           echo "lifecycle: $(head -c 400 /home/codespace/.hermes/state/gateway.lifecycle.json 2>/dev/null || echo MISSING)"
-          echo "heartbeat age_s: $(( $(date +%s) - $(stat -c %Y /home/codespace/.hermes/state/gateway.heartbeat 2>/dev/null || echo 0) ))"
-          echo "persistent log bytes: $(stat -c %s /home/codespace/.hermes/state/hermes-gateway.log 2>/dev/null || echo MISSING)"
+          echo "heartbeat_age_s: $(( $(date +%s) - $(stat -c %Y /home/codespace/.hermes/state/gateway.heartbeat 2>/dev/null || echo 0) ))"
+          echo "persistent_log_bytes: $(stat -c %s /home/codespace/.hermes/state/hermes-gateway.log 2>/dev/null || echo MISSING)"
           echo "config: provider=$(grep -m1 '^provider' /home/codespace/.hermes/config.yaml | awk '{print $2}') model=$(grep -m1 'default:' /home/codespace/.hermes/config.yaml | awk '{print $2}')"
-          echo "env token flag: $(grep -qc 'TELEGRAM_BOT_TOKEN' /home/codespace/.hermes/.env && echo PRESENT)"
-          echo "env gemini flag: $(grep -qc 'GEMINI_API_KEY' /home/codespace/.hermes/.env && echo PRESENT)"
-          echo "pinned revision: $(git -C /home/codespace/hermes-agent- rev-parse --short=10 HEAD 2>/dev/null || echo UNKNOWN)"
-          echo "venv python: $(/home/codespace/hermes-agent-/venv/bin/python --version 2>&1 | awk '{print $2}')"
+          echo "telegram_flag: $(grep -qc 'TELEGRAM_BOT_TOKEN' /home/codespace/.hermes/.env && echo PRESENT || echo MISSING)"
+          echo "gemini_flag: $(grep -qc 'GEMINI_API_KEY' /home/codespace/.hermes/.env && echo PRESENT || echo MISSING)"
+          echo "pinned_revision: $(git -C /home/codespace/hermes-agent- rev-parse --short=10 HEAD 2>/dev/null || echo UNKNOWN)"
+          echo "venv_python: $(/home/codespace/hermes-agent-/venv/bin/python --version 2>&1 | awk '{print $2}')"
           REMOTE
           echo "===== FINAL_AUDIT=DONE ====="
