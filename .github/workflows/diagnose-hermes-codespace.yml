@@ -1,21 +1,28 @@
-name: migration-final-audit-3
+name: pairing-approve
 on:
   workflow_dispatch:
 jobs:
-  audit3:
+  approve:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe NEW (pinned rev + python, correct paths)
+      - name: Approve telegram pairing code on NEW codespace
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
         run: |
           set -uo pipefail
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
-          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
-          R=/home/codespace/.hermes/hermes-agent
-          git -c safe.directory='*' -C "$R" rev-parse --short=10 HEAD | sed 's/^/pinned_revision: /'
-          "$R/venv/bin/python" --version 2>&1 | head -1 | sed 's/^/venv_python: /'
-          "$R/venv/bin/python" -m hermes --version 2>/dev/null | head -1 | sed 's/^/hermes_version: /' || "$R/venv/bin/python" -c "import importlib.metadata as m;print('hermes_version:', m.version('hermes-agent'))" 2>/dev/null | head -1
+          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1 | python3 -c '
+          import sys, re
+          for l in sys.stdin:
+              l = re.sub(r"[0-9]{6,}", "[id]", l)
+              sys.stdout.write(l)
+          '
+          H=/home/codespace/.hermes/hermes-agent/venv/bin/python
+          cd /home/codespace
+          echo "gateway running: $(pgrep -fc 'hermes gateway' || echo 0)"
+          ~/.local/bin/hermes pairing approve telegram GSECGE7H; echo "APPROVE_RC=$?"
+          echo "--- pairing state (sanitized) ---"
+          ~/.local/bin/hermes pairing list 2>/dev/null || true
           REMOTE
-          echo "===== AUDIT3=DONE ====="
+          echo "===== PAIRING=DONE ====="
