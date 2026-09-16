@@ -1,11 +1,11 @@
-name: migration-final-audit-2
+name: migration-final-audit-3
 on:
   workflow_dispatch:
 jobs:
-  audit2:
+  audit3:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe NEW (process provenance, pinned rev, python)
+      - name: Probe NEW (pinned rev + python, correct paths)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
@@ -13,15 +13,9 @@ jobs:
           set -uo pipefail
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
           gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
-          P=$(pgrep -f 'hermes gateway' | head -1)
-          echo "gateway pid: ${P:-NONE}"
-          echo "pid cwd: $(readlink /proc/$P/cwd 2>/dev/null || echo NA)"
-          echo "pid exe: $(tr '\0' ' ' < /proc/$P/cmdline 2>/dev/null | cut -c1-160 || echo NA)"
-          REPO=$(readlink /proc/$P/cwd 2>/dev/null)
-          git -c safe.directory='*' -C "$REPO" rev-parse --short=10 HEAD 2>/dev/null | sed 's/^/pinned_revision: /'
-          PY=$(readlink -f "$REPO/venv/bin/python")
-          echo "venv_python_path: $PY"
-          "$PY" --version 2>&1 | head -1 | sed 's/^/venv_python_version: /'
-          grep -m1 'provider' "$HOME/.hermes/config.yaml" | sed 's/^/provider_line: /'
+          R=/home/codespace/.hermes/hermes-agent
+          git -c safe.directory='*' -C "$R" rev-parse --short=10 HEAD | sed 's/^/pinned_revision: /'
+          "$R/venv/bin/python" --version 2>&1 | head -1 | sed 's/^/venv_python: /'
+          "$R/venv/bin/python" -m hermes --version 2>/dev/null | head -1 | sed 's/^/hermes_version: /' || "$R/venv/bin/python" -c "import importlib.metadata as m;print('hermes_version:', m.version('hermes-agent'))" 2>/dev/null | head -1
           REMOTE
-          echo "===== AUDIT2=DONE ====="
+          echo "===== AUDIT3=DONE ====="
