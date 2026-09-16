@@ -96,10 +96,15 @@ jobs:
           command -v uv; uv --version
 
           echo "===== E4) clone source @ pinned commit ====="
-          ls "$ORIGIN" >/dev/null 2>&1 || true
-          git clone --quiet "$ORIGIN" "$HOME/.hermes/hermes-agent" 2>/tmp/cloneerr || { echo "clone FAILED"; head -5 /tmp/cloneerr; exit 1; }
-          git -C "$HOME/.hermes/hermes-agent" checkout -q 5d59366010640c1d6b8f170d8a4ee109db2bbdef || { echo "PIN CHECKOUT FAILED"; exit 1; }
-          echo "checked out: $(git -C "$HOME/.hermes/hermes-agent" rev-parse HEAD)"
+          SRCD="$HOME/.hermes/hermes-agent"
+          if [ -d "$SRCD/.git" ]; then
+            echo "existing checkout found — reusing (idempotent restore)"
+            git -C "$SRCD" fetch -q origin 2>/dev/null || true
+          else
+            git clone --quiet "$ORIGIN" "$SRCD" 2>/tmp/cloneerr || { echo "clone FAILED"; head -5 /tmp/cloneerr; exit 1; }
+          fi
+          git -C "$SRCD" checkout -q 5d59366010640c1d6b8f170d8a4ee109db2bbdef || { echo "PIN CHECKOUT FAILED"; exit 1; }
+          echo "checked out: $(git -C "$SRCD" rev-parse HEAD)"
 
           echo "===== E5) rebuild venv (uv sync, locked) ====="
           cd "$HOME/.hermes/hermes-agent"
