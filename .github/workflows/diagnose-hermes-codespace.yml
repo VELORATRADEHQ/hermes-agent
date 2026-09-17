@@ -1,53 +1,310 @@
-name: cp-implementation-read
+name: cpanel-deploy
 on:
   workflow_dispatch:
 jobs:
-  read:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Implementation-surface read (read-only)
+      - name: Checkout branch, apply patches, run tests
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
+          PUSH_TOK: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
-          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
+          gh codespace ssh --codespace "$NEW_CS" -- env PUSH_TOK="${GH_TOKEN}" bash -s <<'REMOTE' 2>&1
+          set -euo pipefail
+          mask(){ sed -E 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/[redacted-token]/g'; }
           R=/home/codespace/.hermes/hermes-agent
-          A="$R/plugins/platforms/telegram/adapter.py"
-          echo "===== S1) slash text routing in adapter ====="
-          grep -nE '"(/(model|status|fast|reasoning|new|help))"' "$A" | head -10
-          grep -nE 'def _.*(slash|command)' "$A" | head -8
-          echo "===== S2) callback ctx + auth + edit helpers ====="
-          grep -n 'def _callback_ctx' "$A"; sed -n "$(grep -n 'def _callback_ctx' "$A" | cut -d: -f1),+16p" "$A"
-          grep -n 'def _callback_authorized' "$A"; sed -n "$(grep -n 'def _callback_authorized' "$A" | cut -d: -f1),+14p" "$A"
-          grep -n 'def _edit_md_quiet' "$A"; sed -n "$(grep -n 'def _edit_md_quiet' "$A" | cut -d: -f1),+10p" "$A"
-          grep -n 'def _send_control_message' "$A"; sed -n "$(grep -n 'def _send_control_message' "$A" | cut -d: -f1),+18p" "$A"
-          echo "===== S3) slash command dispatch (typed) ====="
-          grep -nE 'slash_commands|GatewaySlashCommandsMixin|_handle_slash' "$R/gateway/run.py" 2>/dev/null | head -6
-          grep -rnE "('/model'|"/model")" "$R/gateway/slash_commands.py" | head -4
-          grep -nE 'def (build_|register_|_cmd_)' "$R/gateway/slash_commands.py" | head -12
-          echo "===== S4) menu builder ====="
-          grep -nE 'def (telegram_menu_commands|telegram_menu_max_commands)|_DEFAULT_TELEGRAM' "$R/hermes_cli/commands_platforms.py" | head -8
-          sed -n '95,118p' "$R/hermes_cli/commands_platforms.py"
-          echo "===== S5) pairing methods detail ====="
-          sed -n '376,400p' "$R/gateway/pairing.py"
-          sed -n '456,530p' "$R/gateway/pairing.py"
-          echo "===== S6) providers: registry + fetch_models ====="
-          grep -nE 'def (list_providers|get_provider_profile)' "$R/providers/__init__.py"
-          sed -n '113,131p' "$R/providers/__init__.py"
-          grep -rn 'def fetch_models' "$R/hermes_cli/"*.py "$R/providers/"*.py 2>/dev/null | head -4
-          grep -rn 'name: str = "google"' "$R/providers/"*.py 2>/dev/null | head -4
-          echo "===== S7) auth store (auth.json) writers ====="
-          grep -nE 'def [a-z_]*(cred|auth|key)' "$R/hermes_cli/auth.py" | head -16
-          grep -n 'auth.json' "$R/hermes_cli/auth.py" | head -4
-          echo "===== S8) message handler head (intercept point) ====="
-          grep -nE 'async def (_on_message|_handle_message|_handle_text)' "$A" | head -4
-          echo "===== S9) model picker entry (from /model) ====="
-          grep -nE 'def .*model_picker|_model_picker_' "$R/gateway/slash_commands_model.py" | head -6
-          echo "===== S10) config io helpers ====="
-          grep -n 'def read_user_config_raw' "$R/hermes_cli/config.py"
-          grep -n 'def atomic_config_write\|atomic_config_write' "$R/hermes_cli/config.py" | head -3
-          grep -n 'def _gateway_config_home' "$R/gateway/run.py"
-          echo "===== CPREAD=DONE ====="
+          cd "$R"
+          g(){ git -c safe.directory='*' "$@"; }
+          echo "===== 0) state gate ====="
+          X=$(g status --porcelain=v1 | grep -vc '^?? venv$' || true)
+          [ "$X" = "0" ] || { echo "STOP DIRTY"; g status --porcelain=v1 | head; exit 2; }
+          g fetch origin hermes-cpanel 2>&1 | tail -1
+          g checkout -B hermes-cpanel origin/hermes-cpanel 2>&1 | tail -2
+          ls -la gateway/cpanel.py locales/fa.yaml tests/gateway/test_cpanel.py
+          echo "===== 1) t() sanity BEFORE patch (expect key echo = missing) ====="
+          venv/bin/python -c "from agent.i18n import t; print(repr(t('cpanel.back')))" || true
+          echo "===== 2) apply patch ====="
+          cat > /tmp/cp_patch.py <<'PYPATCH'
+            #!/usr/bin/env python3
+            """Apply the Control Panel's minimal in-tree patches (idempotent, assertion-guarded).
+
+            Edits, precisely:
+              adapters: plugins/platforms/telegram/adapter.py  (4 anchored insertions)
+              i18n:     agent/i18n.py                        ("fa" added to SUPPORTED_LANGUAGES)
+              locales:  append the cpanel.* English stub key block to all locales/*.yaml EXCEPT fa.yaml
+                        (fa.yaml ships fully translated from the branch)
+            Anchor failure anywhere => hard exit before any partial second half is applied.
+            """
+            import re
+            import sys
+            from pathlib import Path
+
+            REPO = Path("/home/codespace/.hermes/hermes-agent")
+            ADAPTER = REPO / "plugins/platforms/telegram/adapter.py"
+            I18N = REPO / "agent/i18n.py"
+            LOCALES = REPO / "locales"
+
+            EN_CPANEL_BLOCK = '''cpanel:
+              back: "Back"
+              close: "Close"
+              edit: "Edit (restart wizard)"
+              save: "Save"
+              cancel: "Cancel"
+              refresh: "Refresh"
+              error: "\\u26a0\\ufe0f Operation failed - details were logged (sanitized)."
+              ai:
+                unknown: "not tested yet (explicit tests only)"
+              main:
+                title: "\\U0001f6e1\\ufe0f Hermes Control"
+                provider: "Provider"
+                ai: "AI availability"
+                hint: "Choose a section. All operations are local - no AI call."
+              m:
+                providers: "\\U0001f511 Providers"
+                models: "\\U0001f916 Models"
+                test: "\\U0001f9ea Test Connection"
+                status: "\\U0001f4ca System Status"
+                users: "\\U0001f464 Users"
+                settings: "\\u2699\\ufe0f Settings"
+                logs: "\\U0001f4cb Logs"
+                backup: "\\U0001f4be Backup / Restore"
+              prov:
+                title: "\\U0001f511 Provider Management"
+                legend: "\\U0001f7e2 enabled - \\u26aa disabled - \\u2b50 default - tap a provider for actions"
+                add: "Add Provider"
+                gone: "Provider not found."
+                status: "Status"
+                default: "Default"
+                auth: "Auth"
+                key: "API key"
+                editkey: "Rotate key"
+                setdefault: "Set default"
+                test: "Test"
+                delkey: "Delete key"
+                mkdefault:
+                  done: "Default provider saved. Model stays: "
+              models:
+                title: "\\U0001f916 Model Management"
+                provider: "Provider"
+                active: "Active model"
+                pick: "Tap to set as active (saved to config; no AI call):"
+                none: "No model catalog cached for this provider. Run Test (lists models on success) or type a model id below."
+                type: "Type model id"
+                testsel: "Test current selection"
+                typeask: "Send the model id as a normal message now."
+              test:
+                title: "\\U0001f9ea Connection Test"
+                desc: "Explicit provider/API connectivity check. Single attempt, no auto-retry. Never faked."
+                selected: "Selected"
+                run: "Run test"
+                running: "Testing..."
+                result: "Test result"
+                oknote: "Provider API reachable. (Connectivity only - not an inference check.)"
+                quota: "Reason: provider quota/rate limit (e.g. Google RESOURCE_EXHAUSTED). This is NOT a Hermes failure."
+                auth: "Reason: authentication failed - check the stored key."
+                net: "Reason: network failure."
+                perr: "Reason: provider-side error (5xx). Known transient capacity states are shown as-is."
+                nokey: "Reason: credential not configured."
+                other: "See status code above."
+              status:
+                title: "\\U0001f4ca System Status"
+                note: "Infrastructure status is independent of AI provider health."
+              users:
+                title: "\\U0001f464 User Management"
+                pending: "Pending requests"
+                approve: "Approve"
+                approved: "Approved users"
+                revoke: "Revoke"
+                note: "Codes are never displayed. Rejected/ignored requests expire automatically."
+              settings:
+                title: "\\u2699\\ufe0f Hermes Settings"
+                lang: "Language (display.language)"
+                comp: "Context compression (compression.enabled)"
+                note: "Only settings Hermes already supports are editable here."
+              logs:
+                title: "\\U0001f4cb Logs (sanitized)"
+                unavail: "log unavailable: "
+              backup:
+                title: "\\U0001f4be Backup / Restore"
+                covers: "Covers: config.yaml, auth.json (600), .env (600) - stored locally, never uploaded."
+                create: "Create backup now"
+                recent: "Recent snapshots:"
+                restore: "Restore"
+              confirm:
+                title: "\\u26a0\\ufe0f Confirm"
+                note: "This action is explicit and deliberate."
+                yes: "Confirm"
+                no: "Cancel"
+              add:
+                title: "\\u2795 Add Provider"
+                pick: "Choose provider type (only providers Hermes actually supports are listed):"
+                keyask: "Send the API key as a normal message now."
+                keynote: "It will be stored locally (600), shown masked, and your message will be deleted."
+                nokey: "This provider type does not take an API key here."
+                confirm: "Provider configuration"
+                saved: "Saved (no AI call made)."
+                keyrot: "Key rotated (stored locally, masked): "
+                modelask: "API key captured (masked): "
+                modelpick: "Pick a default model:"
+                skipmodel: "Skip / set later"
+            '''
+
+
+            def patch_adapter() -> None:
+                src = ADAPTER.read_text()
+                if "hctl:" in src and "_handle_cpanel_command" in src:
+                    print("adapter: already patched (idempotent skip)")
+                    return
+                edits = []
+
+                a1_old = "app.add_handler(CallbackQueryHandler(self._handle_callback_query))"
+                a1_new = (a1_old + "\n"
+                          '        app.add_handler(CommandHandler("panel", self._handle_cpanel_command))')
+                edits.append(("panel CommandHandler", a1_old, a1_new, 1))
+
+                a2_old = "        data = query.data\n"
+                a2_new = a2_old + ('        if data.startswith("hctl:"):\n'
+                                   "            from gateway.cpanel import handle_callback as _cpanel_cb\n"
+                                   "            await _cpanel_cb(self, query, data)\n"
+                                   "            return\n")
+                edits.append(("hctl callback branch", a2_old, a2_new, 1))
+
+                a3_old = "    async def _claim_callback_state("
+                a3_new = ('    async def _handle_cpanel_command(self, update, context):\n'
+                          "        \"\"\"`/panel` -- open the AI-independent Hermes control panel.\"\"\"\n"
+                          "        from gateway.cpanel import handle_command as _cpanel_cmd\n"
+                          "        await _cpanel_cmd(self, update, context)\n\n"
+                          "    async def _cpanel_consume_pending(self, update, context) -> bool:\n"
+                          "        from gateway.cpanel import consume_pending_input as _cpanel_pi\n"
+                          "        return await _cpanel_pi(self, update, context)\n\n"
+                          + a3_old)
+                edits.append(("cpanel methods", a3_old, a3_new, 1))
+
+                m = re.search(r"^    async def _handle_text_message\(self, update: Update, context: .*\) -> None:\n", src, re.M)
+                if not m:
+                    print("ANCHOR FAIL: _handle_text_message def not found"); sys.exit(3)
+                a4_old = m.group(0)
+                a4_new = a4_old + ("        if await self._cpanel_consume_pending(update, context):\n"
+                                   "            return\n")
+                edits.append(("pending-input interception", a4_old, a4_new, 1))
+
+                for name, old, new, count in edits:
+                    n = src.count(old)
+                    if n != count:
+                        print(f"ANCHOR FAIL: {name}: expected 1 occurrence, got {n}"); sys.exit(4)
+                    src = src.replace(old, new, 1)
+                ADAPTER.write_text(src)
+                print("adapter: 4 insertions applied")
+
+
+            def patch_i18n() -> None:
+                src = I18N.read_text()
+                if '"fa"' in src.split("SUPPORTED_LANGUAGES")[1].split(")")[0]:
+                    print("i18n: fa already present (idempotent skip)")
+                    return
+                old = '    "af", "ko", "it", "ga", "pt", "ru", "hu", "ar",\n'
+                if src.count(old) != 1:
+                    print("ANCHOR FAIL: SUPPORTED_LANGUAGES line"); sys.exit(5)
+                new = '    "af", "ko", "it", "ga", "pt", "ru", "hu", "ar", "fa",\n'
+                I18N.write_text(src.replace(old, new, 1))
+                print("i18n: fa added")
+
+
+            def patch_locales() -> None:
+                done = []
+                for yf in sorted(LOCALES.glob("*.yaml")):
+                    if yf.name == "fa.yaml":
+                        continue
+                    txt = yf.read_text()
+                    if "\ncpanel:" in txt or txt.startswith("cpanel:"):
+                        done.append(yf.name + " (already)")
+                        continue
+                    with yf.open("a") as fh:
+                        fh.write("\n" + EN_CPANEL_BLOCK)
+                    done.append(yf.name)
+                print("locales: cpanel stub appended to:", ", ".join(done))
+
+
+            if __name__ == "__main__":
+                patch_adapter()
+                patch_i18n()
+                patch_locales()
+                print("CPATCH=DONE")
+          PYPATCH
+          venv/bin/python /tmp/cp_patch.py
+          echo "===== 3) t() sanity AFTER patch ====="
+          venv/bin/python -c "from agent.i18n import t,reset_language_cache; reset_language_cache(); v=t('cpanel.back'); print(repr(v)); assert v=='Back', v; print('I18N_OK')"
+          echo "===== 4) compile + quick import ====="
+          venv/bin/python -m py_compile gateway/cpanel.py plugins/platforms/telegram/adapter.py agent/i18n.py && echo COMPILE_OK
+          venv/bin/python -c "import plugins.platforms.telegram.adapter as a; import gateway.cpanel; print('IMPORT_OK')"
+          grep -c 'hctl:' plugins/platforms/telegram/adapter.py | sed 's/^/hctl refs: /'
+          echo "===== 5) pytest cpanel ====="
+          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q 2>&1 | tail -25
+          REMOTE
+      - name: Commit patches on branch, push, restart gateway, health verify
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+          NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
+          PUSH_TOK: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
+        run: |
+          set -euo pipefail
+          gh codespace ssh --codespace "$NEW_CS" -- env PUSH_TOK="${GH_TOKEN}" bash -s <<'REMOTE' 2>&1
+          set -euo pipefail
+          mask(){ sed -E 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/[redacted-token]/g'; }
+          R=/home/codespace/.hermes/hermes-agent
+          cd "$R"
+          g(){ git -c safe.directory='*' "$@"; }
+          echo "===== 6) test gate re-check + commit ====="
+          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q > /tmp/pt.out 2>&1 && echo "PYTEST_OK $(tail -1 /tmp/pt.out)" || { echo "STOP PYTEST_FAILED"; tail -30 /tmp/pt.out; exit 3; }
+          g add plugins/platforms/telegram/adapter.py agent/i18n.py locales/
+          g -c user.name="velora-ops" -c user.email="ops@veloratrade.local" commit -m "cpanel: adapter hctl wiring + /panel command + fa i18n + locale stubs" 2>&1 | tail -2
+          echo "===== 7) push branch ====="
+          if ! g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" push origin hermes-cpanel 2>&1 | mask; then
+            echo "STOP PUSH_REJECTED"; exit 10
+          fi
+          sleep 4
+          RSHA=$(g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" ls-remote origin refs/heads/hermes-cpanel | awk '{print $1}')
+          LSHA=$(g rev-parse HEAD)
+          echo "local: $LSHA"; echo "remote: $RSHA"
+          [ "$RSHA" = "$LSHA" ] || { echo "STOP LSREMOTE_MISMATCH"; exit 11; }
+          echo "PUSH_VERIFIED"
+          echo "===== 8) gateway restart (process only, persistent log) ====="
+          OLD=$(pgrep -f 'hermes gateway' | head -1 || true)
+          [ -n "$OLD" ] && kill -TERM "$OLD" 2>/dev/null || true
+          for i in $(seq 1 20); do sleep 2; pgrep -f 'hermes gateway' >/dev/null || break; done
+          cd /home/codespace
+          nohup $R/venv/bin/python $R/hermes gateway --accept-hooks run >> /home/codespace/.hermes/state/hermes-gateway.log 2>&1 &
+          NP=$!; echo "new gateway pid: $NP"
+          ok=0
+          for i in $(seq 1 45); do
+            sleep 4
+            if [ -f /home/codespace/.hermes/state/gateway.heartbeat ]; then
+              AGE=$(( $(date +%s) - $(stat -c %Y /home/codespace/.hermes/state/gateway.heartbeat) ))
+              [ "$AGE" -lt 60 ] && { ok=1; echo "heartbeat fresh at poll $i (${AGE}s)"; break; }
+            fi
+          done
+          [ "$ok" = "1" ] || { echo "STOP GATEWAY_NO_HEARTBEAT"; tail -20 /home/codespace/.hermes/state/hermes-gateway.log | sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted]/g'; exit 12; }
+          pgrep -fc 'hermes gateway' | sed 's/^/gateway processes: /'
+          $R/venv/bin/python - <<'PYC' 2>/dev/null || true
+          import json
+          life=json.load(open('/home/codespace/.hermes/state/gateway.lifecycle.json'))
+          print('lifecycle:', life.get('phase'), 'pid', life.get('pid'))
+          PYC
+          echo "===== 9) panel smoke: render every screen offline ====="
+          cd "$R"
+          venv/bin/python - <<'PYD'
+          import gateway.cpanel as cp
+          class A: pass
+          a=A(); a._save_gateway_config_key=None
+          for name,fn in [("main",cp.screen_main),("providers",cp.screen_providers),("models",cp.screen_models),
+                          ("test",cp.screen_test),("status",cp.screen_status),("users",cp.screen_users),
+                          ("settings",cp.screen_settings),("logs",cp.screen_logs),("backup",cp.screen_backup)]:
+              t,k=fn(a); assert t and k is not None, name
+          print("SMOKE_OK 9 screens rendered")
+          PYD
+          echo "===== CPANEL_DEPLOY=DONE ====="
           REMOTE
