@@ -56,12 +56,21 @@ jobs:
           pytest -q tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py tests/gateway/test_custom_provider_request_overrides.py 2>&1 | mask | tail -4
           echo "TEST_GATES=DONE"
           pkill -f 'hermes gateway' || true
-          sleep 6
-          for i in $(seq 1 24); do pgrep -f 'hermes gateway' >/dev/null && break; sleep 5; done
+          sleep 8
+          UP=""
+          for i in $(seq 1 60); do
+            if pgrep -f 'hermes gateway' >/dev/null; then UP=1; break; fi
+            sleep 5
+          done
+          [ -n "$UP" ] || { echo "FAIL: gateway did not come back within 5 minutes"; exit 4; }
+          echo "GATEWAY_UP_AFTER=$(( i*5 ))s"
           pgrep -af 'hermes gateway' | mask
-          sleep 4
+          # give telegram polling a moment, then require a FRESH heartbeat
+          sleep 10
           HB=/home/codespace/.hermes/state/gateway.heartbeat
-          [ -f "$HB" ] && echo "heartbeat age: $(( $(date +%s) - $(stat -c %Y "$HB") ))s"
+          AGE=$(( $(date +%s) - $(stat -c %Y "$HB") ))
+          echo "heartbeat age: ${AGE}s"
+          [ "$AGE" -le 90 ] || { echo "FAIL: stale heartbeat (${AGE}s)"; exit 5; }
           grep -a "Connected to Telegram\|polling" /home/codespace/.hermes/state/hermes-gateway.log | mask | tail -3
           echo "CHECK=DONE"
           REMOTE
