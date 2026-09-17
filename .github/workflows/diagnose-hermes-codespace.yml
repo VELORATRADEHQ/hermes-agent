@@ -16,16 +16,18 @@ jobs:
           TOKEN="$1"
           mask(){ sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted-token]/g; s/AIza[0-9A-Za-z_-]{20,}/[redacted-gemini]/g; s/x-access-token:[^@"]+@/x-access-token:***@/g'; }
           R=/home/codespace/.hermes/hermes-agent
-          PRE=753837183dadf3d39f3e9f2bdb7f52443deb726f
           NEW=db381ff9542a117573eb51292e22296f52a6efd9
+          # valid PRE-deploy tips: task-5 baseline (753837183d) and the intermediate task-7 head (47037126) that an
+          # earlier run may already have pulled before failing a later gate — both fast-forward cleanly to NEW.
+          PRES="753837183dadf3d39f3e9f2bdb7f52443deb726f 470371260038b3092eba03fbf96f80bdac58fdc5"
           TIP=$(git -C "$R" rev-parse hermes-cpanel)
           git -C "$R" remote set-url origin "https://x-access-token:${TOKEN}@github.com/VELORATRADEHQ/hermes-agent.git"
           if [ "$TIP" = "$NEW" ]; then
             echo "ALREADY_AT_TARGET=$NEW (idempotent rerun)"
-          elif [ "$TIP" = "$PRE" ]; then
+          elif echo " $PRES " | grep -q " $TIP "; then
             git -C "$R" pull --ff-only origin hermes-cpanel | mask
           else
-            echo "ABORT: unexpected tip ($TIP) — neither $PRE nor $NEW — no changes made"; exit 2
+            echo "ABORT: unexpected tip ($TIP) — not in {$PRES} nor $NEW — no changes made"; exit 2
           fi
           TIP2=$(git -C "$R" rev-parse hermes-cpanel)
           [ "$TIP2" = "$NEW" ] || { echo "ABORT: post-pull tip ($TIP2) != $NEW"; exit 3; }
