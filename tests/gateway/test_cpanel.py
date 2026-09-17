@@ -63,6 +63,7 @@ class FakeAdapter:
         self.sent = []
         self.edited = []
         self._bot = object()
+        self._handle_command = AsyncMock()  # native command sink (delegation spy)
 
     def _callback_ctx(self, query):
         return {"chat_id": 1, "chat_type": "private", "thread_id": None, "user_name": "t"}
@@ -393,7 +394,7 @@ def test_B2_non_admin_cannot_open_panel_via_command(home, noguard_net):
 # ── New spec C: EVERY sensitive callback re-checks authorization ─────────────
 
 SENSITIVE_CALLBACKS = [
-    "hctl:prov", "hctl:prov:sel:gemini", "hctl:prov:toggle:gemini:off",
+    "hctl:main", "hctl:prov", "hctl:prov:sel:gemini", "hctl:prov:toggle:gemini:off",
     "hctl:prov:mkdefault:gemini", "hctl:prov:delask:gemini", "hctl:prov:del:gemini",
     "hctl:add:start", "hctl:add:pick:gemini", "hctl:add:keyonly:gemini",
     "hctl:models", "hctl:models:set:gemini-3-flash-preview", "hctl:models:type",
@@ -488,7 +489,79 @@ def test_I_native_adapter_dispatch_intact():
     assert 'data.startswith("hctl:")' in src
     assert src.index('data.startswith("hctl:")') < src.index("self._handle_model_picker_callback"), \
         "hctl branch must run before native prefixes"
-    # panel command registered in the handler-setup block
+    # panel/start commands registered BEFORE the generic filters.COMMAND sink
     cls_src = inspect.getsource(ad.TelegramAdapter)
     assert 'CommandHandler("panel"' in cls_src, "panel command registration missing"
+    assert 'CommandHandler("start"' in cls_src, "start command registration missing"
+    i_panel = cls_src.index('CommandHandler("panel"')
+    i_start = cls_src.index('CommandHandler("start"')
+    i_sink = cls_src.index('filters.COMMAND, self._handle_command')
+    assert cls_src.count('CommandHandler("panel"') == 1, "panel registered exactly once (no shadowing)"
+    assert cls_src.count('CommandHandler("start"') == 1, "start registered exactly once"
+    assert i_panel < i_sink and i_start < i_sink, "panel/start must precede the generic command sink"
     assert hasattr(ad.TelegramAdapter, "_handle_cpanel_command")
+    assert hasattr(ad.TelegramAdapter, "_handle_start_menu_command")
+# ── /start menu UX (follow-up): button for admins, native defer for unknowns ─
+
+def _start_update(uid="1", first_name="Admin"):
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=uid, first_name=first_name),
+        message=SimpleNamespace(chat_id=1, message_thread_id=None,
+                                text="/start", reply_text=AsyncMock()))
+
+
+def test_start_admin_gets_panel_button_repeatable(home, noguard_net, real_telegram):
+    a = FakeAdapter()
+    for _ in range(3):  # /start repeatedly: menu must regenerate, no state duplication
+        _run(cp.handle_start_command(a, _start_update(), None))
+    assert len(a.sent) == 3
+    for m in a.sent:
+        kb = m["kb"]
+        assert kb is not None, "admin menu must carry the panel button every time"
+        buttons = [b for row in kb.inline_keyboard for b in row]
+        assert len(buttons) == 1
+        assert ("🎛" in buttons[0].text) or ("Control Panel" in buttons[0].text) or ("کنترل" in buttons[0].text)
+        assert buttons[0].callback_data == "hctl:main"
+    # pressing the button opens the EXISTING panel (hctl:main → screen_main)
+    q = FakeQuery("hctl:main")
+    _run(cp.handle_callback(a, q, "hctl:main"))
+    assert q.edited and ("Hermes Control" in q.edited[0]["text"] or "کنترل" in q.edited[0]["text"])
+    assert not a._handle_command.await_count  # native sink not used for admins
+
+
+def test_start_authorized_user_gets_menu_without_admin_button(home, noguard_net, real_telegram, monkeypatch):
+    import gateway.pairing as gp
+    monkeypatch.setattr(gp.PairingStore, "is_approved", lambda self, p, u: str(u) == "2")
+    a = FakeAdapter()
+    _run(cp.handle_start_command(a, _start_update(uid="2", first_name="User"), None))
+    assert len(a.sent) == 1
+    assert a.sent[0]["kb"] is None, "non-admin must not receive the admin panel button"
+    assert a.sent[0]["text"].strip()  # but a friendly menu text is fine
+    assert not a._handle_command.await_count
+
+
+def test_start_unknown_user_deferred_to_native(home, noguard_net, real_telegram):
+    a = FakeAdapter()
+    _run(cp.handle_start_command(a, _start_update(uid="9", first_name="Stranger"), None))
+    assert a._handle_command.await_count == 1, "unknown /start must reach the native pairing path"
+    assert not a.sent, "unknown user gets NO panel menu"
+
+
+def test_start_replayed_hctl_callback_still_fail_closed(home, noguard_net, real_telegram):
+    """Button hidden from unknown users is not the security boundary: replayed hctl: is denied."""
+    a = FakeAdapter(authorized=False)
+    q = FakeQuery("hctl:main", uid="9")
+    _run(cp.handle_callback(a, q, "hctl:main"))
+    assert not q.edited
+    assert q.answer.await_count >= 1
+
+
+def test_start_menu_needs_no_ai_or_network(home, noguard_net, real_telegram):
+    """noguard_net kills outbound calls; menu and panel open must still work."""
+    a = FakeAdapter()
+    _run(cp.handle_start_command(a, _start_update(), None))
+    assert a.sent, "menu rendered without any provider/LLM availability"
+    q = FakeQuery("hctl:main")
+    _run(cp.handle_callback(a, q, "hctl:main"))
+    text = q.edited[0]["text"]
+    assert "AIza" not in text and "AQ.FAKEKEY" not in text  # no secret in UI
