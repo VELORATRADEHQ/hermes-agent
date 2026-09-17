@@ -16,7 +16,7 @@ jobs:
           TOKEN="$1"
           mask(){ sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted-token]/g; s/AIza[0-9A-Za-z_-]{20,}/[redacted-gemini]/g; s/x-access-token:[^@"]+@/x-access-token:***@/g'; }
           R=/home/codespace/.hermes/hermes-agent
-          NEW=db381ff9542a117573eb51292e22296f52a6efd9
+          NEW=7fb45024fcde8b34e05c17bd238d71a8d3c311ca
           # valid PRE-deploy tips: task-5 baseline (753837183d) and the intermediate task-7 head (47037126) that an
           # earlier run may already have pulled before failing a later gate — both fast-forward cleanly to NEW.
           PRES="753837183dadf3d39f3e9f2bdb7f52443deb726f 470371260038b3092eba03fbf96f80bdac58fdc5"
