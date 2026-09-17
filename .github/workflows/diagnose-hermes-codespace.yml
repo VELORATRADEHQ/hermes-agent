@@ -1,11 +1,11 @@
-name: cp-inspect-4
+name: cp-inspect-5
 on:
   workflow_dispatch:
 jobs:
-  inspect4:
+  inspect5:
     runs-on: ubuntu-latest
     steps:
-      - name: Architecture inspection round 4 (read-only)
+      - name: Architecture inspection round 5 (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
@@ -14,27 +14,44 @@ jobs:
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
           gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
           R=/home/codespace/.hermes/hermes-agent
-          echo "===== A) gateway core files ====="
-          ls "$R/gateway/" | grep -vE '\.pyc|__pycache__' | grep -E 'slash|command|admin|control|panel' || echo "no slash/admin files"
-          ls "$R/gateway/" | grep -v __pycache__ | head -30
-          echo "===== B) config_providers def index ====="
-          grep -nE '^(class |def |    def )' "$R/hermes_cli/config_providers.py" | head -30
-          echo "===== C) where provider config is WRITTEN ====="
-          grep -nE 'safe_dump|write_text|set_key|dotenv|\.env' "$R/hermes_cli/config_providers.py" | head -12
-          echo "===== D) callback-query handler + data prefixes ====="
-          grep -n 'async def _handle_callback_query' "$R/plugins/platforms/telegram/adapter.py"
-          grep -nE 'data\.(startswith|split)|callback_data=' "$R/plugins/platforms/telegram/adapter.py" | head -18
-          echo "===== E) menu_commands construction ====="
-          grep -n 'menu_commands' "$R/plugins/platforms/telegram/adapter.py" | head -6
-          echo "===== F) slash command registry ====="
-          grep -nE '^(class |def |    def )' "$R/gateway/slash_commands_model.py" | head -12
-          grep -rln 'register_slash\|SLASH_COMMANDS\|slash_dispatch' "$R/gateway/" --include='*.py' | grep -v __pycache__ | head -6
-          echo "===== G) provider catalog (supported providers) ====="
-          grep -nE '^\s*["\x27](google|openai|anthropic|openrouter|groq|mistral|xai|nvidia|kimi|nous|deepseek|ollama|azure|bedrock|custom)' "$R/hermes_cli/provider_catalog.py" | head -25
-          wc -l "$R/hermes_cli/provider_catalog.py"
-          echo "===== H) approval flow (buttons precedent) ====="
-          grep -nE '^(class |def |    def |EA_)' "$R/gateway/platforms/base_exec_approval.py" | head -15
-          echo "===== I) remote ====="
-          git -c safe.directory='*' -C "$R" remote -v | sed 's|https://[^@]*@|https://[redacted]@|' | head -3
+          echo "===== A) install mode ====="
+          "$R/venv/bin/python" -c "import hermes_gateway_run_check" 2>/dev/null || true
+          "$R/venv/bin/pip" list 2>/dev/null | grep -i hermes || "$R/venv/bin/python" -m pip list 2>/dev/null | grep -i hermes
+          "$R/venv/bin/python" -c "import gateway, plugins.platforms.telegram.adapter as a; print('gateway from:', gateway.__file__); print('adapter from:', a.__file__)"
+          echo "===== B) cp: prefix context at 3958 ====="
+          sed -n '3948,3962p' "$R/plugins/platforms/telegram/adapter.py"
+          echo "===== C) _save_gateway_config_key usage ====="
+          sed -n '561,576p' "$R/gateway/slash_commands_model.py"
+          echo "===== D) providers map in config.yaml (masked) ====="
+          python3 - <<'PYEOF'
+          import yaml,re
+          c=yaml.safe_load(open('/home/codespace/.hermes/config.yaml'))
+          def mask(x):
+            if isinstance(x,dict): return {k:('[masked]' if re.search('key|token|secret',k,re.I) else mask(v)) for k,v in x.items()}
+            if isinstance(x,list): return [mask(v) for v in x]
+            return x
+          m=c.get('model',{})
+          print('model keys:', sorted(m.keys()))
+          prov=m.get('providers')
+          print('providers type:', type(prov).__name__)
+          if prov: print(yaml.safe_dump(mask(prov), default_flow_style=False)[:900])
+          PYEOF
+          echo "===== E) owner/admin concept in pairing ====="
+          grep -nE 'owner|admin|role' "$R/gateway/pairing.py" | head -12
+          echo "--- approved telegram file keys (masked):"
+          python3 - <<'PYEOF2'
+          import json,glob
+          for p in glob.glob('/home/codespace/.hermes/pairing/*telegram*')+glob.glob('/home/codespace/.hermes/pairing/approved*'):
+            d=json.load(open(p))
+            print(p.split('/')[-1], '->', type(d).__name__, list(d.keys())[:6] if isinstance(d,dict) else len(d))
+          PYEOF2
+          echo "===== F) slash_access (admin gate?) ====="
+          grep -nE '^(class |def |    def |[A-Z_]+ =)' "$R/gateway/slash_access.py" | head -15
+          echo "===== G) i18n catalog format sample ====="
+          head -12 "$R/locales/en.yaml"
+          echo "--- language selection source:"
+          grep -nE 'get_language|HERMES_LANG|display.*language|language.*config' "$R/agent/i18n.py" | head -8
+          echo "===== H) control-style sender signature ====="
+          sed -n '3777,3800p' "$R/plugins/platforms/telegram/adapter.py"
           REMOTE
-          echo "===== INSPECT4=DONE ====="
+          echo "===== INSPECT5=DONE ====="
