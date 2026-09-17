@@ -1,11 +1,11 @@
-name: cpanel-healthcheck
+name: cpanel-aj-verify
 on:
   workflow_dispatch:
 jobs:
-  check:
+  verify:
     runs-on: ubuntu-latest
     steps:
-      - name: Read gateway log tail + process state (read-only)
+      - name: Sync branch, run cpanel suite + native I-evidence, read-only access audit
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
@@ -13,13 +13,41 @@ jobs:
           set -euo pipefail
           gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
           set -euo pipefail
-          mask(){ sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted-token]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/[redacted]/g; s/AIza[0-9A-Za-z_-]{20,}/[redacted-gemini]/g'; }
-          echo "===== processes ====="
-          pgrep -af 'hermes gateway' | mask
-          echo "===== heartbeat age ====="
+          R=/home/codespace/.hermes/hermes-agent
+          cd "$R"
+          g(){ git -c safe.directory='*' "$@"; }
+          echo "===== 0) sync branch tip ====="
+          g fetch origin hermes-cpanel 2>&1 | tail -1
+          g checkout -B hermes-cpanel origin/hermes-cpanel 2>&1 | tail -1
+          g rev-parse --short HEAD
+          g status --porcelain=v1 | grep -v '^?? venv' | head -5 || true
+          echo "===== 1) cpanel suite (A-J) ====="
+          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q 2>&1 | tail -6
+          echo "===== 2) spec I: native behavior files (unmodified functionality) ====="
+          venv/bin/python -m pytest tests/gateway/test_slash_access.py tests/gateway/test_slash_access_dispatch.py tests/gateway/test_unauthorized_dm_behavior.py -q 2>&1 | tail -6
+          echo "===== 3) runtime access state (READ-ONLY, masked; var NAMES only, no values) ====="
+          venv/bin/python - <<'PYZ'
+          import json, re
+          from pathlib import Path
+          env = Path('/home/codespace/.hermes/.env').read_text()
+          names = sorted({l.split('=',1)[0].strip() for l in env.splitlines() if '=' in l and not l.strip().startswith('#')})
+          gate_vars = [n for n in names if any(k in n for k in ('ALLOW','POLICY','ADMIN'))]
+          def has(n): return n in names
+          print('TELEGRAM_ALLOWED_USERS configured:', bool([n for n in names if 'TELEGRAM' in n and 'ALLOW' in n]))
+          print('TELEGRAM_DM_POLICY configured:', has('TELEGRAM_DM_POLICY'))
+          print('TELEGRAM_GROUP_POLICY configured:', has('TELEGRAM_GROUP_POLICY'))
+          print('GATEWAY_ALLOW_ALL_USERS configured:', has('GATEWAY_ALLOW_ALL_USERS'))
+          print('admin-related vars present:', [re.sub(r'_.*','_…',n) for n in gate_vars])
+          from gateway.pairing import PairingStore
+          st = PairingStore()
+          appr = st.list_approved('telegram')
+          pend = st.list_pending('telegram')
+          print('approved telegram users: %d (ids masked: %s)' % (len(appr), ['…'+str(u.get('user_id',''))[-3:] for u in appr]))
+          print('pending telegram requests: %d' % len(pend))
+          PYZ
+          echo "===== gateway state ====="
+          pgrep -fc 'hermes gateway' | sed 's/^/gateway processes: /'
           HB=/home/codespace/.hermes/state/gateway.heartbeat
           [ -f "$HB" ] && echo "heartbeat age: $(( $(date +%s) - $(stat -c %Y "$HB") ))s"
-          echo "===== gateway log tail (sanitized) ====="
-          tail -40 /home/codespace/.hermes/state/hermes-gateway.log | mask | grep -avi "debug" | tail -25
-          echo "===== CHECK=DONE ====="
+          echo "===== VERIFY_AJ=DONE ====="
           REMOTE
