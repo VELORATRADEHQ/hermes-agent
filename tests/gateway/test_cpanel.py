@@ -20,8 +20,10 @@ import gateway.cpanel as cp
 
 @pytest.fixture()
 def home(tmp_path, monkeypatch):
-    """Isolated HERMES home for all cpanel file IO."""
+    """Isolated HERMES home for all cpanel file IO; user "1" is the configured admin."""
     monkeypatch.setattr("gateway.run._gateway_config_home", lambda: tmp_path)
+    import gateway.pairing as _gp
+    monkeypatch.setattr(_gp, "_configured_allowlist", lambda platform=None: ["1"])
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     (tmp_path / "backups").mkdir(exist_ok=True)
     (tmp_path / "config.yaml").write_text("model:\n  default: gemini-3-flash-preview\n  provider: google\n")
