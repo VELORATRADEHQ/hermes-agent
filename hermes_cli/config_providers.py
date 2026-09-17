@@ -6,6 +6,7 @@ Split out of ``hermes_cli/config.py``; every name is re-imported there, so
 so tests patching that module still intercept the call.
 """
 
+import json
 import logging
 import re
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -117,7 +118,9 @@ _KNOWN_PROVIDER_KEYS = {
     "name", "api", "url", "base_url", "api_key", "key_env", "api_key_env", "key_cmd",
     "api_mode", "transport", "model", "default_model", "models", "models_discovered",
     "context_length", "rate_limit_delay", "request_timeout_seconds", "stale_timeout_seconds",
-    "discover_models", "extra_body", "extra_headers", "capabilities", "ssl_ca_cert", "ssl_verify"}
+    "discover_models", "extra_body", "extra_headers", "capabilities", "ssl_ca_cert", "ssl_verify",
+    # Task-7 protocol-declaration blocks (optional; absence = legacy OpenAI-style inference):
+    "auth", "probe", "discovery", "runtime", "provider_capabilities"}
 
 
 def _pick_provider_base_url(entry: Dict[str, Any], provider_key: str) -> str:
@@ -179,6 +182,140 @@ def _normalize_provider_models(models: Any) -> Tuple[Dict[str, Any], bool]:
                 k: v for k, v in item.items() if k not in {"id", "name"}}
         return normalized_models, discovered
     return {}, discovered
+
+
+# --------------------------------------------------------------------------
+# Task-7 unified provider declarations (configure-first; runtime comes later).
+# Legacy entries omit these keys entirely and keep legacy behavior:
+#   auth.type=bearer + discovery={base}/models + runtime=openai_chat inference.
+# --------------------------------------------------------------------------
+
+AUTH_TYPES = ("bearer", "api_key_header", "none", "native")
+RUNTIME_PROTOCOLS = ("openai_chat", "openai_responses", "task_run", "none")
+_DISCOVERY_TYPES = ("models", "none", "custom")
+
+# Capabilities that make a provider eligible for the interactive /model picker's
+# inference listing. A provider whose declared capabilities contain none of these
+# is task-only and never shows up as an ordinary chat-model choice.
+INFERENCE_CAPABILITIES = frozenset({"chat", "completion", "embeddings"})
+
+# What a legacy (undeclared) custom provider is assumed capable of. This preserves
+# EVERY legacy config's runtime and picker behavior exactly.
+LEGACY_CAPABILITY_DEFAULTS = frozenset({"chat", "completion"})
+
+_CAP_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+
+def _norm_capabilities(value: Any) -> List[str]:
+    """``provider_capabilities:`` -> validated, deduped, stable-ordered list of capability ids.
+
+    Unknown names are accepted (forward-compat); malformed tokens are dropped with a
+    warn-once so a typo can't silently widen a provider's behavior.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    out: List[str] = []
+    for raw in value:
+        if not isinstance(raw, str):
+            continue
+        tok = raw.strip().lower()
+        if _CAP_KEY_RE.fullmatch(tok) and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _norm_auth_block(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    auth_type = str(value.get("type") or "bearer").strip().lower()
+    if auth_type not in AUTH_TYPES:
+        return None
+    out: Dict[str, Any] = {"type": auth_type}
+    header = str(value.get("header") or "").strip()
+    if header and re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,63}", header):
+        out["header"] = header
+    prefix = str(value.get("prefix") or "").strip()
+    if prefix and len(prefix) <= 64:
+        out["prefix"] = prefix
+    return out
+
+
+def _norm_discovery_block(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    dtype = str(value.get("type") or "models").strip().lower()
+    if dtype not in _DISCOVERY_TYPES:
+        return None
+    out: Dict[str, Any] = {"type": dtype}
+    models_url = str(value.get("models_url") or "").strip()
+    if dtype == "custom" and models_url.startswith("https://"):
+        out["models_url"] = models_url
+    return out
+
+
+def _norm_runtime_block(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    proto = str(value.get("protocol") or "openai_chat").strip().lower()
+    if proto not in RUNTIME_PROTOCOLS:
+        return None
+    return {"protocol": proto}
+
+
+_PROG_BODY_LIMIT = 4096
+
+
+def _norm_probe_block(value: Any, *, strict: bool = False) -> Optional[Dict[str, Any]]:
+    """Probe contract: relative https path, safe headers, optional body, expected statuses.
+
+    ``strict`` rejects unknown response shapes; the lenient default packs everything for
+    pass-through so legacy saved configs survive round-trips untouched.
+    """
+    if not isinstance(value, dict):
+        return None
+    out: Dict[str, Any] = {}
+    method = str(value.get("method") or "GET").strip().upper()
+    out["method"] = method if method in {"GET", "POST", "HEAD"} else "GET"
+    path = str(value.get("path") or "").strip()
+    if len(path) > 2048:
+        path = path[:2048]
+    if path and path.startswith("/"):
+        out["path"] = path
+    headers = normalize_extra_headers(value.get("headers"))
+    if headers:
+        out["headers"] = headers
+    body = value.get("body")
+    if isinstance(body, (dict, list, bool, int, float)):
+        body = json.dumps(body)
+    if isinstance(body, str) and body.strip():
+        out["body"] = body[:_PROG_BODY_LIMIT]
+    statuses = value.get("expected_statuses")
+    if isinstance(statuses, (list, tuple, set)):
+        chosen = sorted({int(s) for s in statuses if isinstance(s, (int, float)) and 200 <= int(s) <= 599})
+        if chosen:
+            out["expected_statuses"] = chosen
+    auth_kind = value.get("auth")
+    if isinstance(auth_kind, str) and auth_kind.strip().lower() in AUTH_TYPES:
+        out["auth"] = auth_kind.strip().lower()
+    else:
+        out.pop("auth", None)
+    if strict:
+        # Refuse to persist anything that can't express a real request or success contract.
+        return out if out.get("expected_statuses") or out.get("path") else None
+    return out
+
+
+def derive_effective_capabilities(entry: Any) -> frozenset:
+    """Capability frozenset used by pickers/UI. Explicit ``provider_capabilities`` wins;
+    otherwise the frozenset an old custom provider implied (chat inference) is returned, so
+    legacy entries keep legacy behavior with zero migration."""
+    if isinstance(entry, dict):
+        caps = _norm_capabilities(entry.get("provider_capabilities"))
+        if caps:
+            return frozenset(caps)
+    return frozenset(LEGACY_CAPABILITY_DEFAULTS)
 
 
 def _normalize_custom_provider_entry(
@@ -250,6 +387,17 @@ def _normalize_custom_provider_entry(
         _put("capabilities", {
             key: value for key, value in capabilities.items()
             if isinstance(key, str) and isinstance(value, bool)})
+
+    provider_caps = _norm_capabilities(entry.get("provider_capabilities"))
+    if provider_caps:
+        normalized["provider_capabilities"] = provider_caps
+
+    for block_key, norm_fn in (
+            ("auth", _norm_auth_block), ("discovery", _norm_discovery_block),
+            ("runtime", _norm_runtime_block), ("probe", _norm_probe_block)):
+        cleaned = norm_fn(entry.get(block_key))
+        if cleaned is not None:
+            normalized[block_key] = cleaned
 
     for field, ok in (
         ("context_length", lambda v: isinstance(v, int) and v > 0),

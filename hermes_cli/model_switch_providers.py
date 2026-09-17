@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional
 from agent.command_token_source import build_command_token_provider, materialize_probe_api_key
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug, get_label
+from hermes_cli.config_providers import INFERENCE_CAPABILITIES
 from utils import base_url_host_matches
 
 # Log-record parity with the origin module.
@@ -1200,6 +1201,36 @@ def _prepend_moa_picker_provider(providers: List[dict], current_provider: str = 
         return providers
 
 
+def _custom_capability_lookup(custom_providers) -> dict:
+    """slug/alias(lower) -> declared capability frozenset for custom provider entries.
+
+    Only entries that EXPLICITLY declare ``provider_capabilities:`` appear here; legacy
+    entries map to nothing so the /model picker keeps treating them as inference-capable
+    (back-compat contract from the v13.1 unify)."""
+    if not custom_providers or not isinstance(custom_providers, list):
+        return {}
+    from hermes_cli.config_providers import _norm_capabilities
+    from hermes_cli.config import coerce_provider_id
+    out: dict = {}
+    for e in custom_providers:
+        if not isinstance(e, dict):
+            continue
+        caps = _norm_capabilities(e.get("provider_capabilities"))
+        if not caps:
+            continue
+        frozen = frozenset(caps)
+        name = coerce_provider_id(e.get("name"))
+        pk = str(e.get("provider_key") or "").strip()
+        if name:
+            out[custom_provider_slug(name, pk).lower()] = frozen
+            for alias in custom_provider_aliases(name, pk):
+                if alias:
+                    out[str(alias).lower()] = frozen
+        if pk:
+            out[pk.lower()] = frozen
+    return out
+
+
 def list_picker_providers(
     current_provider: str = "", current_base_url: str = "", user_providers: dict = None,
     custom_providers: list | None = None, max_models: int | None = None, current_model: str = "",
@@ -1219,7 +1250,15 @@ def list_picker_providers(
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
 
     filtered: List[dict] = []
+    caps_lookup = _custom_capability_lookup(custom_providers)
     for p in providers:
+        # Task-only providers (declared capabilities with NO inference capability) are not
+        # chat-model choices: they run tasks, not text completions. Legacy entries without a
+        # declaration keep old behavior (they are inference-capable by definition).
+        caps = p.get("provider_capabilities") or caps_lookup.get(str(p.get("slug", "")).strip().lower())
+        caps = frozenset(c for c in (caps or []) if isinstance(c, str)) if isinstance(caps, (list, tuple, set, frozenset)) else None
+        if caps and caps.isdisjoint(INFERENCE_CAPABILITIES):
+            continue
         if str(p.get("slug", "")).lower() == "openrouter":
             try:
                 live_ids = [mid for mid, _ in fetch_openrouter_models()]
