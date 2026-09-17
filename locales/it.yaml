@@ -564,3 +564,6 @@ cpanel:
     modelask: "API key captured (masked): "
     modelpick: "Pick a default model:"
     skipmodel: "Skip / set later"
+  start:
+    welcome: "\U0001F6E1\uFE0F Hermes is running. Choose an option:"
+    panel_button: "\U0001F39B Control Panel"

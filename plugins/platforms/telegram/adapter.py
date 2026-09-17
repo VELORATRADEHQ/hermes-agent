@@ -2751,6 +2751,8 @@ class TelegramAdapter(BasePlatformAdapter):
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
+        app.add_handler(CommandHandler("panel", self._handle_cpanel_command))
+        app.add_handler(CommandHandler("start", self._handle_start_menu_command))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(
             filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION), self._handle_location_message))
@@ -2758,7 +2760,6 @@ class TelegramAdapter(BasePlatformAdapter):
             filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
             self._handle_media_message))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
-        app.add_handler(CommandHandler("panel", self._handle_cpanel_command))
         # Inline command picker; inert until the owner enables inline mode via BotFather /setinline.
         app.add_handler(InlineQueryHandler(self._handle_inline_query))
         # gateway_platform_event observer: group 99 observes alongside, never displaces, core handlers.
@@ -4334,6 +4335,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """`/panel` -- open the AI-independent Hermes control panel."""
         from gateway.cpanel import handle_command as _cpanel_cmd
         await _cpanel_cmd(self, update, context)
+
+    async def _handle_start_menu_command(self, update, context):
+        """`/start` -- welcome menu; admins get the Control Panel entry button."""
+        from gateway.cpanel import handle_start_command as _cpanel_start
+        await _cpanel_start(self, update, context)
 
     async def _cpanel_consume_pending(self, update, context) -> bool:
         from gateway.cpanel import consume_pending_input as _cpanel_pi
