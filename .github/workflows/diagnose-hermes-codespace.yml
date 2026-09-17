@@ -1,4 +1,4 @@
-name: canonical-repo-migration-finalize
+name: canonical-repo-migration-finalize2
 on:
   workflow_dispatch:
 jobs:
@@ -25,8 +25,9 @@ jobs:
           if g merge-base --is-ancestor FETCH_HEAD HEAD; then
             echo "remote tip already absorbed: $FT"
           else
-            DELTA=$(g diff --name-only HEAD..FETCH_HEAD)
-            echo "delta vs remote tip: $DELTA"
+            MB=$(g merge-base HEAD FETCH_HEAD)
+            DELTA=$(g diff --name-only "$MB"..FETCH_HEAD)
+            echo "remote-side delta since merge-base $MB: $DELTA"
             for f in $DELTA; do
               case "$f" in .github/workflows/*) : ;; *) echo "STOP UNEXPECTED_REMOTE_CHANGE $f"; exit 4;; esac
             done
