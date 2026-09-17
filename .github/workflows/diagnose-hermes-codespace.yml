@@ -31,7 +31,7 @@ jobs:
           print("read_user_config_raw sig:", inspect.signature(hc.read_user_config_raw))
           from providers import list_providers
           profs = {p.name: p for p in list_providers() if getattr(p, "name", "")}
-          g = profs.get("google")
+          g = profs.get("gemini")
           if g:
               print("google profile attrs:", sorted(k for k in vars(g).keys())[:30])
               print("google env_vars:", getattr(g, "env_vars", None), "| base_url:", getattr(g, "base_url", None))
