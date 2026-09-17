@@ -1,4 +1,4 @@
-name: cpanel-deploy5
+name: cpanel-deploy7
 on:
   workflow_dispatch:
 jobs:
@@ -16,8 +16,8 @@ jobs:
           TOKEN="$1"
           mask(){ sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted-token]/g; s/AIza[0-9A-Za-z_-]{20,}/[redacted-gemini]/g; s/x-access-token:[^@"]+@/x-access-token:***@/g'; }
           R=/home/codespace/.hermes/hermes-agent
-          PRE=a5ac6de3274da45877e668afb9eea2cba7172c37
-          NEW=753837183dadf3d39f3e9f2bdb7f52443deb726f
+          PRE=753837183dadf3d39f3e9f2bdb7f52443deb726f
+          NEW=470371260038b3092eba03fbf96f80bdac58fdc5
           TIP=$(git -C "$R" rev-parse hermes-cpanel)
           git -C "$R" remote set-url origin "https://x-access-token:${TOKEN}@github.com/VELORATRADEHQ/hermes-agent.git"
           if [ "$TIP" = "$NEW" ]; then
@@ -46,10 +46,36 @@ jobs:
           assert (yaml.safe_load(open("locales/fa.yaml"))["cpanel"]["persist"]["button"]) == "\U0001F39B پنل مدیریت"
           print("LOCALE_CHECK_OK", n, "locales")
           PY
+          python3 - <<'PY'
+          import yaml, glob
+          keys=[k for k in yaml.safe_load(open("locales/en.yaml")) if k.startswith(("help.","cpanel."))]
+          keyset=set(yaml.safe_load(open("locales/en.yaml")))
+          for f in sorted(glob.glob("locales/*.yaml")):
+              d=yaml.safe_load(open(f)) or {}
+              flat={}
+              def fl(node,prefix):
+                  if isinstance(node,dict):
+                      for k,v in node.items(): fl(v,(prefix+"."+str(k)) if prefix else str(k))
+                  else: flat[prefix]=node
+              fl(d,"")
+              assert set(flat)==keyset, f"{f}: catalog parity broken ({len(set(flat)^keyset)} keys differ)"
+          assert yaml.safe_load(open("locales/fa.yaml"))["help"]["title"].startswith("📖")
+          print("PARITY_CHECK_OK", len(glob.glob('locales/*.yaml')), "locales,", len(keyset), "keys")
+          PY
           echo "=== SUITE: cpanel existing ==="
           pytest -q tests/gateway/test_cpanel.py 2>&1 | mask | tail -4
           echo "=== SUITE: cpanel t5 (persist+custom) ==="
           pytest -q tests/gateway/test_cpanel_t5.py 2>&1 | mask | tail -60
+          echo "=== SUITE: cpanel t7 (probe-gated registration + capability UI) ==="
+          pytest -q tests/gateway/test_cpanel_t7.py 2>&1 | mask | tail -15
+          echo "=== SUITE: task-7 provider probe engine ==="
+          pytest -q tests/gateway/test_provider_probe.py 2>&1 | mask | tail -6
+          echo "=== SUITE: task-7 clean surface (menu filter + localized help) ==="
+          pytest -q tests/gateway/test_help_surface.py 2>&1 | mask | tail -6
+          echo "=== SUITE: task-7 provider unification (config + model picker) ==="
+          pytest -q tests/hermes_cli/test_config_providers.py tests/hermes_cli/test_model_picker_task_only.py 2>&1 | mask | tail -6
+          echo "=== SUITE: i18n catalog parity (all languages) ==="
+          pytest -q tests/agent/test_i18n.py 2>&1 | mask | tail -6
           echo "=== SUITE: native custom-provider persistence ==="
           pytest -q tests/tui_gateway/test_custom_provider_session_persistence.py tests/hermes_cli/test_model_provider_persistence.py 2>&1 | mask | tail -4
           echo "=== SUITE: native telegram auth + fail-closed + custom-provider runtime ==="
