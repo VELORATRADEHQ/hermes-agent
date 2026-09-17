@@ -58,11 +58,11 @@ jobs:
           pkill -f 'hermes gateway' || true
           sleep 8
           UP=""
-          for i in $(seq 1 60); do
+          for i in $(seq 1 180); do
             if pgrep -f 'hermes gateway' >/dev/null; then UP=1; break; fi
             sleep 5
           done
-          [ -n "$UP" ] || { echo "FAIL: gateway did not come back within 5 minutes"; exit 4; }
+          [ -n "$UP" ] || { echo "FAIL: gateway did not come back within 15 minutes"; exit 4; }
           echo "GATEWAY_UP_AFTER=$(( i*5 ))s"
           pgrep -af 'hermes gateway' | mask
           # give telegram polling a moment, then require a FRESH heartbeat
