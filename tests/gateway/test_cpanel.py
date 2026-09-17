@@ -517,12 +517,23 @@ def test_start_admin_gets_panel_button_repeatable(home, noguard_net, real_telegr
     assert len(a.sent) == 3
     for m in a.sent:
         kb = m["kb"]
-        assert kb is not None, "admin menu must carry the panel button every time"
-        buttons = [b for row in kb.inline_keyboard for b in row]
-        assert len(buttons) == 1
-        assert ("🎛" in buttons[0].text) or ("Control Panel" in buttons[0].text) or ("کنترل" in buttons[0].text)
-        assert buttons[0].callback_data == "hctl:main"
-    # pressing the button opens the EXISTING panel (hctl:main → screen_main)
+        assert kb is not None, "admin menu must carry the persistent panel control every time"
+        rows = getattr(kb, "keyboard", None)
+        assert rows, "admin control is the PERSISTENT reply keyboard (survives restarts), not an inline row"
+        label = rows[0][0].text
+        assert ("🎛" in label) or ("Control Panel" in label) or ("پنل" in label)
+    # tapping the persistent label routes into the EXISTING panel via the pending intercept
+    tap = SimpleNamespace(
+        effective_user=SimpleNamespace(id="1"),
+        callback_query=None,
+        message=SimpleNamespace(chat_id=1, message_thread_id=None,
+                                text=rows[0][0].text, reply_text=AsyncMock(), delete=AsyncMock()))
+    consumed = _run(cp.consume_pending_input(a, tap, None))
+    assert consumed is True
+    assert len(a.sent) == 4, "panel main screen delivered after tap"
+    panel_kb = a.sent[-1]["kb"]
+    assert getattr(panel_kb, "inline_keyboard", None), "existing inline panel opens (same hctl: panel)"
+    # the direct hctl:main path is unchanged for /panel users
     q = FakeQuery("hctl:main")
     _run(cp.handle_callback(a, q, "hctl:main"))
     assert q.edited and ("Hermes Control" in q.edited[0]["text"] or "کنترل" in q.edited[0]["text"])
