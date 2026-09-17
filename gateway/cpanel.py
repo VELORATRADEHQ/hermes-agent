@@ -106,6 +106,19 @@ def _env_get(name: str) -> Optional[str]:
             return v
     return None
 
+def _first_set_env(env_vars: Tuple[str, ...]) -> Tuple[str, Optional[str]]:
+    """Return (var_name, value) of the first credential var that is actually set.
+
+    Falls back to (env_vars[0], None) when none is set, so callers still know
+    the canonical write target."""
+    vars_ = tuple(env_vars or ())
+    for v in vars_:
+        val = _env_get(v)
+        if val:
+            return v, val
+    return (vars_[0] if vars_ else "", None)
+
+
 def _env_write(name: str, value: Optional[str]) -> bool:
     """Set or remove (value=None) a VAR= line in ~/.hermes/.env, atomic, 600."""
     path = _env_path()
@@ -198,8 +211,7 @@ def _provider_rows() -> List[Dict[str, Any]]:
     rows = []
     for name, prof in sorted(_profiles().items()):
         env_vars = tuple(getattr(prof, "env_vars", ()) or ())
-        key_var = env_vars[0] if env_vars else ""
-        key_val = _env_get(key_var) if key_var else None
+        key_var, key_val = _first_set_env(env_vars)
         rows.append({
             "name": name,
             "display": getattr(prof, "display_name", "") or name,
@@ -495,7 +507,7 @@ def run_connection_test(provider_name: str) -> Dict[str, Any]:
     if not prof:
         return {"ok": False, "kind": "unknown_provider", "provider": provider_name, "ts": ts}
     env_vars = tuple(getattr(prof, "env_vars", ()) or ())
-    key = _env_get(env_vars[0]) if env_vars else None
+    key_var_used, key = _first_set_env(env_vars)
     base_url = (getattr(prof, "base_url", "") or "").rstrip("/")
     models_url = getattr(prof, "models_url", "") or (base_url + "/models" if base_url else "")
     if not base_url and not models_url:
