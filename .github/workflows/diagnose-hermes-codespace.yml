@@ -1,61 +1,27 @@
-name: canonical-repo-migration-finalize3
+name: post-migration-reverify
 on:
   workflow_dispatch:
 jobs:
   migrate3:
     runs-on: ubuntu-latest
     steps:
-      - name: Absorb latest remote tip (guarded), push, verify
+      - name: Post-migration re-verify (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
         run: |
-          set -euo pipefail
+          set -uo pipefail
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
-          gh codespace ssh --codespace "$NEW_CS" -- env PUSH_TOK="${GH_TOKEN}" bash -s <<'REMOTE' 2>&1
-          set -euo pipefail
-          mask(){ sed -E 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/[redacted-token]/g'; }
+          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
           cd /home/codespace/.hermes/hermes-agent
           g(){ git -c safe.directory='*' "$@"; }
-          [ "$(g rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "STOP NOT_ON_MAIN"; exit 2; }
-          X=$(g status --porcelain=v1 | grep -vc '^?? venv$' || true)
-          [ "$X" = "0" ] || { echo "STOP STATUS_DRIFT"; g status; exit 3; }
-          g fetch https://github.com/VELORATRADEHQ/hermes-agent.git main 2>&1 | tail -1
-          FT=$(g rev-parse FETCH_HEAD)
-          if g merge-base --is-ancestor FETCH_HEAD HEAD; then
-            echo "remote tip already absorbed: $FT"
-          else
-            MB=$(g merge-base HEAD FETCH_HEAD)
-            DELTA=$(g diff --name-only "$MB"..FETCH_HEAD)
-            echo "remote-side delta since merge-base $MB: $DELTA"
-            for f in $DELTA; do
-              case "$f" in .github/workflows/*) : ;; *) echo "STOP UNEXPECTED_REMOTE_CHANGE $f"; exit 4;; esac
-            done
-            g merge --no-edit FETCH_HEAD
-            echo "absorbed tip, merged head: $(g rev-parse HEAD)"
-          fi
-          if ! g remote get-url upstream 2>/dev/null | grep -q 'NousResearch/hermes-agent.git'; then
-            g remote rename origin upstream
-          fi
-          g remote get-url origin >/dev/null 2>&1 && g remote set-url origin https://github.com/VELORATRADEHQ/hermes-agent.git || g remote add origin https://github.com/VELORATRADEHQ/hermes-agent.git
+          echo "pwd: $(pwd)"
+          echo "branch: $(g rev-parse --abbrev-ref HEAD)"
+          echo "HEAD: $(g rev-parse HEAD)"
           echo "--- remotes:"; g remote -v
-          g remote get-url upstream | grep -q 'github.com/NousResearch/hermes-agent.git' || { echo "STOP UPSTREAM_WRONG"; exit 8; }
-          g remote get-url origin | grep -q 'github.com/VELORATRADEHQ/hermes-agent.git' || { echo "STOP ORIGIN_WRONG"; exit 9; }
-          g config http.postBuffer 1073741824
-          echo "--- pushing $(g rev-parse --short HEAD) to origin/main (no force)..."
-          if ! g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" push origin main 2>&1 | mask; then
-            echo "STOP PUSH_REJECTED"; exit 10
-          fi
-          sleep 5
-          RSHA=$(g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" ls-remote origin refs/heads/main | awk '{print $1}')
-          LSHA=$(g rev-parse HEAD)
-          echo "local HEAD:  $LSHA"; echo "remote main: $RSHA"
-          [ "$RSHA" = "$LSHA" ] || { echo "STOP LSREMOTE_MISMATCH local=$LSHA remote=$RSHA"; exit 11; }
-          g branch -u origin/main main 2>&1 | tail -1
-          echo "PUSH_VERIFIED"
+          echo "--- status:"; g status --porcelain=v1
+          echo "version: $(grep -m1 '^version' pyproject.toml)"
           venv/bin/python -c "import gateway, plugins.platforms.telegram.adapter, providers; print('IMPORT_OK')"
-          grep -m1 '^version' pyproject.toml
-          echo "gateway still running: $(pgrep -fc 'hermes gateway' || echo 0)"
-          echo "tracked .github files:"; g ls-files .github
-          echo "===== CANONICAL_MIGRATION=DONE ====="
+          echo "gateway running: $(pgrep -fc 'hermes gateway' || echo 0)"
+          echo "===== REVERIFY=DONE ====="
           REMOTE
