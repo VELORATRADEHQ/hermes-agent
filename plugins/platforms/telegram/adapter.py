@@ -2758,6 +2758,7 @@ class TelegramAdapter(BasePlatformAdapter):
             filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
             self._handle_media_message))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+        app.add_handler(CommandHandler("panel", self._handle_cpanel_command))
         # Inline command picker; inert until the owner enables inline mode via BotFather /setinline.
         app.add_handler(InlineQueryHandler(self._handle_inline_query))
         # gateway_platform_event observer: group 99 observes alongside, never displaces, core handlers.
@@ -4307,6 +4308,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not query or not query.data:
             return
         data = query.data
+        if data.startswith("hctl:"):
+            from gateway.cpanel import handle_callback as _cpanel_cb
+            await _cpanel_cb(self, query, data)
+            return
         cb = self._callback_ctx(query)
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
@@ -4324,6 +4329,15 @@ class TelegramAdapter(BasePlatformAdapter):
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+
+    async def _handle_cpanel_command(self, update, context):
+        """`/panel` -- open the AI-independent Hermes control panel."""
+        from gateway.cpanel import handle_command as _cpanel_cmd
+        await _cpanel_cmd(self, update, context)
+
+    async def _cpanel_consume_pending(self, update, context) -> bool:
+        from gateway.cpanel import consume_pending_input as _cpanel_pi
+        return await _cpanel_pi(self, update, context)
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
@@ -5924,6 +5938,8 @@ class TelegramAdapter(BasePlatformAdapter):
         return self._apply_telegram_group_observe_attribution(event)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._cpanel_consume_pending(update, context):
+            return
         """Handle incoming text; buffers client-split chunks into one MessageEvent."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
