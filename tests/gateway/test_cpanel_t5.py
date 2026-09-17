@@ -152,9 +152,9 @@ def test_p1_tap_opens_panel_and_rechecks_auth(env, monkeypatch):
     consumed = run(_c(a, tmsg("🎛 پنل مدیریت")))
     assert consumed is True and seen.get("called")
     assert a.sent
-    kb = a.sent[-1]["kb"]
-    labels = [b.text for row in (kb.inline_keyboard if kb else []) for b in row]
-    assert labels
+    texts = [m["text"] or "" for m in a.sent]
+    assert any(("Hermes Control" in t) or ("هرمس" in t) for t in texts), f"tap must open the existing panel: {texts!r}"
+    assert a.sent[-1]["kb"] is not None  # existing inline panel keyboard (env-independent)
 
 def test_p1_tap_other_locale_label_still_recognized(env, monkeypatch):
     monkeypatch.setattr(cp, "_start_user_kind", lambda a, u: "admin")
@@ -370,7 +370,7 @@ def test_p2_models_screen_from_discovery(env, monkeypatch):
     a = LoAdapter()
     a._save_gateway_config_key("providers.acme.api", "https://x.example/v1")
     q = run(_cb(a, "hctl:cust:models:acme"))
-    assert any("m1" in (row[0].text if isinstance(row[0].text, str) else str(row[0])) for row in q.edited[-1][1].inline_keyboard)
+    assert q.edited and "m1" in (q.edited[-1][0] or ""), f"models list must render in editable text: {q.edited!r}"
 
 def test_p2_website_is_metadata_only_no_scrape(env, monkeypatch):
     calls = []
