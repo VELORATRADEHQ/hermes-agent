@@ -1,170 +1,22 @@
-name: cpanel-startmenu-deploy
+name: cpanel-healthcheck2
 on:
   workflow_dispatch:
 jobs:
-  deploy:
+  check:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync branch, apply patch v2, run tests
+      - name: Post-restart gateway health (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
-          PUSH_TOK: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
           set -euo pipefail
           gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
           set -euo pipefail
-          R=/home/codespace/.hermes/hermes-agent
-          cd "$R"
-          g(){ git -c safe.directory='*' "$@"; }
-          echo "===== 0) sync branch tip (expect 2c1833b3) ====="
-          g fetch origin hermes-cpanel 2>&1 | tail -1
-          g checkout -B hermes-cpanel origin/hermes-cpanel 2>&1 | tail -1
-          g rev-parse --short HEAD
-          g status --porcelain=v1 | grep -v '^?? venv' | head -3 || true
-          echo "===== 1) apply patch v2 ====="
-          cat > /tmp/cp_patch_v2.py <<'PYPATCH'
-          """cpanel patch v2 — idempotent, assertion-guarded. Operates on the branch state that
-          already has patch v1 applied (panel CommandHandler AFTER the generic command sink).
-
-          Changes:
-          A) adapter: move `CommandHandler("panel", ...)` BEFORE the `filters.COMMAND` sink
-             and add `CommandHandler("start", self._handle_start_menu_command)` there too.
-             (PTB group-0 first-match-wins: panel/start were shadowed by the sink.)
-          B) adapter: add `_handle_start_menu_command` delegating method.
-          C) locales: append `cpanel.start.{welcome,panel_button}` (en stub values) to every
-             non-fa locale that lacks them. fa.yaml carries its own Persian values (committed).
-          """
-          import sys
-          from pathlib import Path
-
-          REPO = Path("/home/codespace/.hermes/hermes-agent")
-          ADAPTER = REPO / "plugins/platforms/telegram/adapter.py"
-          LOCALES = REPO / "locales"
-
-          START_STUB = '''  start:
-              welcome: "\\U0001F6E1\\uFE0F Hermes is running. Choose an option:"
-              panel_button: "\\U0001F39B Control Panel"
-          '''
-
-          def patch_adapter() -> None:
-              src = ADAPTER.read_text()
-              if 'CommandHandler("start", self._handle_start_menu_command)' in src:
-                  print("adapter: already v2")
-              else:
-                  line = '        app.add_handler(CommandHandler("panel", self._handle_cpanel_command))\n'
-                  if src.count(line) != 1:
-                      print(f"ANCHOR FAIL: panel registration line count = {src.count(line)}"); sys.exit(2)
-                  src = src.replace(line, "", 1)  # remove from shadowed position
-                  sink = '        app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))\n'
-                  if src.count(sink) != 1:
-                      print("ANCHOR FAIL: generic command sink line"); sys.exit(3)
-                  ins = ('        app.add_handler(CommandHandler("panel", self._handle_cpanel_command))\n'
-                         '        app.add_handler(CommandHandler("start", self._handle_start_menu_command))\n')
-                  src = src.replace(sink, ins + sink, 1)
-                  anchor = ('    async def _handle_cpanel_command(self, update, context):\n'
-                            '        """`/panel` -- open the AI-independent Hermes control panel."""\n'
-                            '        from gateway.cpanel import handle_command as _cpanel_cmd\n'
-                            '        await _cpanel_cmd(self, update, context)\n')
-                  if src.count(anchor) != 1:
-                      print("ANCHOR FAIL: _handle_cpanel_command block"); sys.exit(4)
-                  method = ('\n'
-                            '    async def _handle_start_menu_command(self, update, context):\n'
-                            '        """`/start` -- welcome menu; admins get the Control Panel entry button."""\n'
-                            '        from gateway.cpanel import handle_start_command as _cpanel_start\n'
-                            '        await _cpanel_start(self, update, context)\n')
-                  src = src.replace(anchor, anchor + method, 1)
-                  ADAPTER.write_text(src)
-                  print("adapter: v2 applied (panel/start registered before command sink; start method added)")
-
-          def patch_locales() -> None:
-              done = []
-              for yf in sorted(LOCALES.glob("*.yaml")):
-                  if yf.name == "fa.yaml":
-                      done.append("fa.yaml (committed Persian values)")
-                      continue
-                  txt = yf.read_text()
-                  if "\n  start:\n" in txt or txt.rstrip().endswith("start:"):
-                      done.append(yf.name + " (already)")
-                      continue
-                  if "\ncpanel:" not in txt:
-                      print(f"ANCHOR FAIL: {yf.name} lost cpanel block"); sys.exit(5)
-                  with yf.open("a") as fh:
-                      fh.write(START_STUB)
-                  done.append(yf.name)
-              print("locales: start keys ->", ", ".join(done))
-
-          if __name__ == "__main__":
-              patch_adapter()
-              patch_locales()
-              print("CPATCH_V2=DONE")
-          PYPATCH
-          venv/bin/python /tmp/cp_patch_v2.py
-          echo "===== 2) sanity: registration order + i18n ====="
-          venv/bin/python - <<'PYX'
-          src = open("plugins/platforms/telegram/adapter.py").read()
-          ip = src.index('CommandHandler("panel"'); ist = src.index('CommandHandler("start"')
-          isnk = src.index("filters.COMMAND, self._handle_command")
-          assert src.count('CommandHandler("panel"') == 1 and src.count('CommandHandler("start"') == 1
-          assert ip < isnk and ist < isnk, "ordering wrong"
-          print("ORDER_OK panel/start precede command sink")
-          from agent.i18n import t, reset_language_cache
-          reset_language_cache()
-          assert t("cpanel.start.panel_button") != "cpanel.start.panel_button", "start keys missing"
-          print("I18N_OK", repr(t("cpanel.start.panel_button")))
-          PYX
-          echo "===== 3) compile + import ====="
-          venv/bin/python -m py_compile gateway/cpanel.py plugins/platforms/telegram/adapter.py && echo COMPILE_OK
-          venv/bin/python -c "import plugins.platforms.telegram.adapter; import gateway.cpanel; print('IMPORT_OK')"
-          echo "===== 4) cpanel suite ====="
-          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q 2>&1 | tail -6
-          echo "===== 5) native I-files ====="
-          venv/bin/python -m pytest tests/gateway/test_slash_access.py tests/gateway/test_slash_access_dispatch.py tests/gateway/test_unauthorized_dm_behavior.py -q 2>&1 | tail -4
-          REMOTE
-      - name: Commit patched files, push, restart gateway, verify
-        env:
-          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-          NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
-          PUSH_TOK: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-        run: |
-          set -euo pipefail
-          gh codespace ssh --codespace "$NEW_CS" -- env PUSH_TOK="${GH_TOKEN}" bash -s <<'REMOTE' 2>&1
-          set -euo pipefail
-          mask(){ sed -E 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/[redacted-token]/g'; }
-          R=/home/codespace/.hermes/hermes-agent
-          cd "$R"
-          g(){ git -c safe.directory='*' "$@"; }
-          echo "===== 6) gate + commit ====="
-          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q > /tmp/pt.out 2>&1 && echo "PYTEST_OK $(tail -1 /tmp/pt.out)" || { echo "STOP PYTEST_FAILED"; tail -30 /tmp/pt.out; exit 3; }
-          g add plugins/platforms/telegram/adapter.py locales/
-          g -c user.name="velora-ops" -c user.email="ops@veloratrade.local" commit -m "cpanel: register panel/start handlers before command sink; start locale stubs (17 locales)" 2>&1 | tail -2
-          echo "===== 7) push + verify ====="
-          if ! g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" push origin hermes-cpanel 2>&1 | mask; then
-            echo "STOP PUSH_REJECTED"; exit 10
-          fi
-          sleep 4
-          RSHA=$(g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" ls-remote origin refs/heads/hermes-cpanel | awk '{print $1}')
-          LSHA=$(g rev-parse HEAD)
-          echo "local: $LSHA"; echo "remote: $RSHA"
-          [ "$RSHA" = "$LSHA" ] || { echo "STOP LSREMOTE_MISMATCH"; exit 11; }
-          echo "PUSH_VERIFIED"
-          echo "===== 8) gateway restart (process only) ====="
-          OLD=$(pgrep -f 'hermes gateway' | head -1 || true)
-          [ -n "$OLD" ] && kill -TERM "$OLD" 2>/dev/null || true
-          for i in $(seq 1 20); do sleep 2; pgrep -f 'hermes gateway' >/dev/null || break; done
-          cd /home/codespace
-          nohup $R/venv/bin/hermes gateway --accept-hooks run >> /home/codespace/.hermes/state/hermes-gateway.log 2>&1 &
-          echo "new gateway pid: $!"
-          ok=0
-          for i in $(seq 1 45); do
-            sleep 4
-            if [ -f /home/codespace/.hermes/state/gateway.heartbeat ]; then
-              AGE=$(( $(date +%s) - $(stat -c %Y /home/codespace/.hermes/state/gateway.heartbeat) ))
-              [ "$AGE" -lt 60 ] && { ok=1; echo "heartbeat fresh at poll $i (${AGE}s)"; break; }
-            fi
-          done
-          [ "$ok" = "1" ] || { echo "STOP GATEWAY_NO_HEARTBEAT"; tail -15 /home/codespace/.hermes/state/hermes-gateway.log | sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted]/g'; exit 12; }
-          pgrep -fc 'hermes gateway' | sed 's/^/gateway processes: /'
-          tail -5 /home/codespace/.hermes/state/hermes-gateway.log | sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted]/g' | grep -i "connect\|polling" || true
-          echo "===== STARTMENU_DEPLOY=DONE ====="
+          mask(){ sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted-token]/g; s/AIza[0-9A-Za-z_-]{20,}/[redacted-gemini]/g'; }
+          pgrep -af 'hermes gateway' | mask
+          HB=/home/codespace/.hermes/state/gateway.heartbeat
+          [ -f "$HB" ] && echo "heartbeat age: $(( $(date +%s) - $(stat -c %Y "$HB") ))s"
+          grep -a "Connected to Telegram\|polling" /home/codespace/.hermes/state/hermes-gateway.log | mask | tail -3
+          echo "CHECK=DONE"
           REMOTE
