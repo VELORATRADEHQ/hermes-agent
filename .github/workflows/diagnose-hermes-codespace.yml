@@ -1,11 +1,11 @@
-name: cp-inspect-1
+name: cp-inspect-2
 on:
   workflow_dispatch:
 jobs:
-  inspect:
+  inspect2:
     runs-on: ubuntu-latest
     steps:
-      - name: Architecture inspection on NEW codespace (read-only)
+      - name: Architecture inspection round 2 (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
@@ -14,33 +14,28 @@ jobs:
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
           gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
           R=/home/codespace/.hermes/hermes-agent
-          H=/home/codespace/.hermes
-          echo "===== A) git state ====="
-          git -c safe.directory='*' -C "$R" status -sb | head -5
-          git -c safe.directory='*' -C "$R" log -1 --format='HEAD %h %s'
-          echo "===== B) tree ====="
-          ls "$R"
-          echo "--- python files total: $(find "$R" -name '*.py' -not -path '*/venv/*' -not -path '*/.venv/*' | wc -l)"
-          echo "===== C) telegram gateway modules ====="
-          find "$R" -iname '*telegram*' -name '*.py' -not -path '*/venv/*' -not -path '*/.venv/*' -exec wc -l {} +
-          echo "===== D) callback / inline keyboard support ====="
-          grep -rl --include='*.py' -e 'callback_query' -e 'InlineKeyboard' -e 'inline_keyboard' "$R" --exclude-dir=venv --exclude-dir=.venv | head -10
-          echo "===== E) pairing ====="
-          find "$R" -iname '*pair*' -name '*.py' -not -path '*/venv/*' -not -path '*/.venv/*' -exec wc -l {} +
-          echo "===== F) provider abstraction ====="
-          find "$R" -ipath '*provider*' -name '*.py' -not -path '*/venv/*' -not -path '*/.venv/*' | head -20
-          grep -rln --include='*.py' 'class.*Provider' "$R" --exclude-dir=venv --exclude-dir=.venv | grep -v '/test' | head -10
-          echo "===== G) config + credential layout (keys only) ====="
-          ls -la "$H" | awk '{print $1, $9}'
-          echo "--- config.yaml top-level keys:"
-          grep -oE '^[a-zA-Z_]+:' "$H/config.yaml"
-          echo "--- .env variable names:"
-          sed 's/=.*//' "$H/.env"
-          echo "--- files in ~/.hermes (depth1):"
-          find "$H" -maxdepth 1 -mindepth 1 -printf '%f\n'
-          echo "===== H) localization ====="
-          grep -rli --include='*.py' -e 'i18n' -e 'gettext' -e 'persian' -e 'fa_IR' "$R" --exclude-dir=venv --exclude-dir=.venv | head -5 || echo "none"
-          echo "===== I) message dispatch entry (gateway) ====="
-          grep -rn --include='*.py' -l 'handle_update\|on_message\|process_update\|MessageHandler' "$R" --exclude-dir=venv --exclude-dir=.venv | head -10
+          echo "===== A) telegram plugin dir ====="
+          wc -l "$R/plugins/platforms/telegram/"*.py 2>/dev/null | head -30
+          echo "===== B) gateway/platforms dir ====="
+          ls "$R/gateway/platforms/"
+          echo "===== C) function index: telegram plugin entry ====="
+          for f in "$R/plugins/platforms/telegram/"*.py; do
+            echo "--- $(basename "$f"):"
+            grep -nE '^(class |def |async def |    async def |    def )' "$f" | head -12
+          done 2>/dev/null | head -120
+          echo "===== D) i18n languages ====="
+          grep -nE '(SUPPORTED|LANGS|LOCALES|"fa|"en|"ar|"es|"zh|fa_IR)' "$R/agent/i18n.py" | head -20
+          echo "===== E) managed bot ====="
+          grep -nE '^(class |def |async def )' "$R/hermes_cli/telegram_managed_bot.py" | head -25
+          echo "--- what calls managed bot:"
+          grep -rln 'telegram_managed_bot' "$R" --include='*.py' --exclude-dir=venv --exclude-dir=.venv | grep -v tests | head -5
+          echo "===== F) pairing store + module ====="
+          ls /home/codespace/.hermes/pairing/ 2>/dev/null
+          find "$R/gateway" -iname '*pair*' -name '*.py' | head -5
+          echo "===== G) config.yaml top-level keys ====="
+          grep -oE '^[a-zA-Z_]+:' /home/codespace/.hermes/config.yaml | head -25
+          echo "===== H) existing slash commands in telegram plugin ====="
+          grep -rnoE '"/[a-z_]+"' "$R/plugins/platforms/telegram/" 2>/dev/null | sort -t: -k2 -u | head -40 || echo none-found-here
+          grep -rln 'def _cmd_model\|handle_model\|model_picker' "$R/plugins" "$R/gateway" --include='*.py' 2>/dev/null | grep -v tests | head -8
           REMOTE
-          echo "===== INSPECT1=DONE ====="
+          echo "===== INSPECT2=DONE ====="
