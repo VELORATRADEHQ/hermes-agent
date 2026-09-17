@@ -21,8 +21,12 @@ jobs:
           g rev-parse --abbrev-ref HEAD
           grep -c 'hctl:' plugins/platforms/telegram/adapter.py | sed 's/^/hctl refs: /'
           echo "===== 1) ensure pip (ensurepip) then install pytest into venv ====="
-          if [ ! -x venv/bin/pip ]; then venv/bin/python -m ensurepip --upgrade 2>&1 | tail -2; fi
-          venv/bin/python -m pip install -q pytest pytest-asyncio 2>&1 | tail -3
+          if ! venv/bin/python -m pytest --version >/dev/null 2>&1; then
+            if command -v uv >/dev/null 2>&1; then uv pip install -q --python "$R/venv/bin/python" pytest pytest-asyncio; echo "via uv(PATH)";
+            elif [ -x "$HOME/.local/bin/uv" ]; then "$HOME/.local/bin/uv" pip install -q --python "$R/venv/bin/python" pytest pytest-asyncio; echo "via uv(local)";
+            elif [ -x "$HOME/.cargo/bin/uv" ]; then "$HOME/.cargo/bin/uv" pip install -q --python "$R/venv/bin/python" pytest pytest-asyncio; echo "via uv(cargo)";
+            else curl -sSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && venv/bin/python /tmp/get-pip.py -q && venv/bin/python -m pip install -q pytest pytest-asyncio; echo "via get-pip"; fi
+          fi
           venv/bin/python -m pytest --version
           echo "===== 2) pytest cpanel ====="
           venv/bin/python -m pytest tests/gateway/test_cpanel.py -q 2>&1 | tail -30
