@@ -911,11 +911,14 @@ async def consume_pending_input(adapter, update, context) -> bool:
 
 # ── backup/restore ────────────────────────────────────────────────────────────
 
-def _do_backup() -> Tuple[bool, str]:
+def _do_backup(tag: str = "") -> Tuple[bool, str]:
     home = _home()
     bdir = home / "backups"
     bdir.mkdir(parents=True, exist_ok=True)
-    name = f"cpanel-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}.tar.gz"
+    safe_tag = re.sub(r"[^a-z0-9-]", "", (tag or "").lower())
+    name = f"cpanel-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}{safe_tag}.tar.gz"
+    if safe_tag == "" and (bdir / name).exists():
+        name = f"cpanel-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}-{int(time.time()*1000)%100000:05d}.tar.gz"
     target = bdir / name
     files = ["config.yaml", "auth.json", ".env"]
     try:
@@ -934,7 +937,7 @@ def _do_restore(name: str) -> Tuple[bool, str]:
     snap = (home / "backups" / name)
     if not snap.exists() or not name.startswith("cpanel-") or not name.endswith(".tar.gz"):
         return False, "snapshot not found"
-    ok, _ = _do_backup()  # fresh pre-restore backup first
+    ok, _ = _do_backup("-prerestore")  # fresh pre-restore backup first (distinct name)
     try:
         with tarfile.open(snap) as tf:
             for member in tf.getmembers():
