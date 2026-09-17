@@ -19,9 +19,10 @@ jobs:
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
         run: |
           set -euo pipefail
-          gh codespace cp /tmp/art/cpanel.py "remote:/tmp/art_cpanel.py" --codespace "$NEW_CS"
-          gh codespace cp /tmp/art/test_cpanel_t5.py "remote:/tmp/art_test5.py" --codespace "$NEW_CS"
-          gh codespace cp /tmp/art/cpanel_patch_v3.py "remote:/tmp/art_patchv3.py" --codespace "$NEW_CS"
+          base64 -w0 /tmp/art/cpanel.py | gh codespace ssh --codespace "$NEW_CS" -- bash -c 'base64 -d > /tmp/art_cpanel.py'
+          base64 -w0 /tmp/art/test_cpanel_t5.py | gh codespace ssh --codespace "$NEW_CS" -- bash -c 'base64 -d > /tmp/art_test5.py'
+          base64 -w0 /tmp/art/cpanel_patch_v3.py | gh codespace ssh --codespace "$NEW_CS" -- bash -c 'base64 -d > /tmp/art_patchv3.py'
+          gh codespace ssh --codespace "$NEW_CS" -- bash -c 'cd /tmp && python3 -m py_compile art_cpanel.py art_test5.py art_patchv3.py && echo REMOTE_SYNTAX_OK'
           gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
           set -euo pipefail
           mask(){ sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted-token]/g; s/AIza[0-9A-Za-z_-]{20,}/[redacted-gemini]/g'; }
