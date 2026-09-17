@@ -69,6 +69,17 @@ def tu(text=None, query=None, uid="1"):
     )
 
 
+_PROBE_OK = {"ok": True, "verdict": "SUCCESS", "category": "success", "http_status": 200,
+             "capabilities": ["chat", "completion"], "task_only": False,
+             "model_ids": ["m1"], "notes": []}
+
+
+def _probe_ok(monkeypatch):
+    """Task-7: edits/save paths are gated on the generic probe. Old-behavior tests mock it to OK;
+    the failure branches are covered by tests/gateway/test_cpanel_t7.py."""
+    monkeypatch.setattr(cp, "_probe_entry", AsyncMock(return_value=dict(_PROBE_OK)))
+
+
 def tmsg(text, uid="1"):
     m = SimpleNamespace(text=text, chat_id=1, message_thread_id=None,
                         delete=AsyncMock(), reply_text=AsyncMock())
@@ -198,6 +209,7 @@ def _wizard_start(env, monkeypatch):
 
 
 def test_p2_wizard_full_bearer_flow(env, monkeypatch):
+    _probe_ok(monkeypatch)
     monkeypatch.setattr(cp, "_profiles", lambda: {"openai": SimpleNamespace()})
     monkeypatch.setattr(cp, "discover_models", lambda b, m, k: (["m1", "m2"], "success"))
     a = _wizard_start(env, monkeypatch)
@@ -267,6 +279,7 @@ def test_p2_base_url_validation(env, monkeypatch):
     assert cp._pending_get("1")["step"] == "auth"
 
 def test_p2_noauth_flow_saves_without_key(env, monkeypatch):
+    _probe_ok(monkeypatch)
     monkeypatch.setattr(cp, "_profiles", lambda: {})
     monkeypatch.setattr(cp, "discover_models", lambda b, m, k: (["llama3"], "success"))
     a = _wizard_start(env, monkeypatch)
@@ -279,6 +292,7 @@ def test_p2_noauth_flow_saves_without_key(env, monkeypatch):
     assert e["api"] == "http://localhost:1234/v1" and "key_env" not in e
 
 def test_p2_discovery_failure_still_saves(env, monkeypatch):
+    _probe_ok(monkeypatch)
     monkeypatch.setattr(cp, "_profiles", lambda: {})
     monkeypatch.setattr(cp, "discover_models", lambda b, m, k: (None, "malformed"))
     a = _wizard_start(env, monkeypatch)
@@ -324,6 +338,7 @@ def test_p2_delete_removes_config_and_key(env, monkeypatch):
     assert "CUSTOM_ACME_API_KEY" not in (env / ".env").read_text()
 
 def test_p2_edit_base_url(env, monkeypatch):
+    _probe_ok(monkeypatch)
     a = LoAdapter()
     a._save_gateway_config_key("providers.acme.api", "https://old.example/v1")
     run(_cb(a, "hctl:cwx:eb:acme"))
@@ -332,6 +347,7 @@ def test_p2_edit_base_url(env, monkeypatch):
     assert cfg(env)["providers"]["acme"]["api"] == "https://new.example/v2"
 
 def test_p2_rotate_key_rewrites_env_var(env, monkeypatch):
+    _probe_ok(monkeypatch)
     a = LoAdapter()
     a._save_gateway_config_key("providers.acme.api", "https://x.example/v1")
     a._save_gateway_config_key("providers.acme.key_env", "CUSTOM_ACME_API_KEY")
@@ -374,6 +390,7 @@ def test_p2_models_screen_from_discovery(env, monkeypatch):
 
 def test_p2_website_is_metadata_only_no_scrape(env, monkeypatch):
     calls = []
+    _probe_ok(monkeypatch)
     monkeypatch.setattr(cp, "discover_models", lambda b, m, k: calls.append((b, m, k)) or (None, "malformed"))
     monkeypatch.setattr(cp, "_profiles", lambda: {})
     a = _wizard_start(env, monkeypatch)

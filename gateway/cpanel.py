@@ -420,6 +420,149 @@ def screen_main(adapter):
             [(L5, "hctl:users")], [(L6, "hctl:settings")], [(L7, "hctl:logs")], [(L8, "hctl:backup")]]
     return text, _kb(adapter, rows)
 
+# ── task-7 unified-provider helpers (presentation only; no runtime change) ───
+
+_TASK_CAPS = frozenset({"browser_tasks", "async_runs", "status_polling"})
+
+def _entry_caps(entry: Dict[str, Any]) -> List[str]:
+    """Declared `provider_capabilities:` of a saved provider entry (may be [])."""
+    try:
+        from hermes_cli.config_providers import _norm_capabilities
+        return _norm_capabilities((entry or {}).get("provider_capabilities"))
+    except Exception:
+        raw = (entry or {}).get("provider_capabilities")
+        return [str(x).strip().lower() for x in raw] if isinstance(raw, list) else []
+
+
+def _entry_effective_caps(entry: Dict[str, Any]) -> List[str]:
+    """Explicit declaration wins; legacy entries report legacy inference defaults."""
+    try:
+        from hermes_cli.config_providers import derive_effective_capabilities
+        return sorted(derive_effective_capabilities(entry or {}))
+    except Exception:
+        caps = _entry_caps(entry)
+        return sorted(caps if caps else ["chat", "completion"])
+
+
+def _entry_task_only(entry: Dict[str, Any]) -> bool:
+    try:
+        from hermes_cli.config_providers import INFERENCE_CAPABILITIES
+        caps = _entry_caps(entry)
+        return bool(caps) and frozenset(caps).isdisjoint(INFERENCE_CAPABILITIES)
+    except Exception:
+        caps = _entry_caps(entry)
+        return bool(caps) and not (set(caps) & {"chat", "completion", "embeddings"})
+
+
+def _entry_protocol_line(entry: Dict[str, Any]) -> str:
+    runtime = (entry or {}).get("runtime")
+    proto = str(runtime.get("protocol")) if isinstance(runtime, dict) and runtime.get("protocol") else ""
+    disc = (entry or {}).get("discovery")
+    dtype = str(disc.get("type")) if isinstance(disc, dict) and disc.get("type") else "models"
+    if not proto:
+        return "openai-compatible (chat/completions + models)"
+    disc_line = {"models": "models", "none": "no discovery", "custom": "custom discovery"}.get(dtype, "models")
+    return f"{proto} runtime · {disc_line}"
+
+
+def _entry_auth_line(entry: Dict[str, Any]) -> str:
+    auth = (entry or {}).get("auth")
+    if isinstance(auth, dict) and auth.get("type"):
+        atype = str(auth.get("type"))
+        if atype == "api_key_header" and auth.get("header"):
+            return f"{auth['header']} header"
+        return atype
+    return "bearer"
+
+
+def _entry_discovery_supported(entry: Dict[str, Any]) -> bool:
+    disc = (entry or {}).get("discovery")
+    return not (isinstance(disc, dict) and str(disc.get("type")) == "none")
+
+
+def _entry_has_cred(entry: Dict[str, Any]) -> bool:
+    entry = entry or {}
+    key_var = str(entry.get("key_env") or "")
+    auth = entry.get("auth")
+    if isinstance(auth, dict) and str(auth.get("type")) == "none":
+        return True
+    return bool((_env_get(key_var) if key_var else "") or entry.get("api_key"))
+
+
+def _probe_note(kind: str, ok: bool) -> str:
+    """Localized human explanation for a probe verdict (seconds lines of the 🧪 test)."""
+    mapping = {
+        "quota": _T("cpanel.test.quota", "Reason: provider quota/rate limit (e.g. Google RESOURCE_EXHAUSTED). This is NOT a Hermes failure."),
+        "auth": _T("cpanel.test.auth", "Reason: authentication failed — check the stored key."),
+        "not_found": _T("cpanel.test.404", "Reason: endpoint not found — check base URL / models path."),
+        "timeout": _T("cpanel.test.timeout", "Reason: connection timeout."),
+        "network": _T("cpanel.test.net", "Reason: network failure."),
+        "malformed": _T("cpanel.test.malformed", "Reason: response did not satisfy the expected probe contract."),
+        "no_key": _T("cpanel.test.nokey", "Reason: credential not configured."),
+        "provider_error": _T("cpanel.test.perr", "Reason: provider-side error (5xx). Known transient capacity states are shown as-is."),
+    }
+    if ok:
+        return _T("cpanel.test.oknote", "Provider API reachable. (Connectivity only — not an inference check.)")
+    return mapping.get(kind, _T("cpanel.test.other", "See status code above."))
+
+
+async def _probe_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the generic task-7 probe against a config entry (never raises)."""
+    try:
+        from gateway import provider_probe
+        return await provider_probe.probe_provider_entry(dict(entry or {}))
+    except Exception as exc:
+        from gateway.provider_probe import NETWORK
+        return {"verdict": NETWORK, "category": "network", "ok": False,
+                "http_status": 0, "notes": [f"engine:{type(exc).__name__}"],
+                "capabilities": _entry_effective_caps(entry), "task_only": _entry_task_only(entry),
+                "model_ids": []}
+
+
+def _wizard_probe_entry(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate wizard session state into a probe-shaped config entry."""
+    auth_type = str(d.get("auth") or "bearer")
+    auth: Dict[str, Any] = {"type": auth_type}
+    if auth_type == "api_key_header" and d.get("auth_header"):
+        auth["header"] = str(d["auth_header"])
+    entry = {
+        "name": str(d.get("id") or "wizard"),
+        "base_url": str(d.get("base_url") or "").rstrip("/"),
+        "api_key": str(d.get("key") or ""),
+        "auth": auth,
+    }
+    for block in ("probe", "discovery", "runtime", "provider_capabilities"):
+        if d.get(block):
+            entry[block] = d[block]
+    return entry
+
+
+def _pending_nearby_declared_nodiscovery(d: Dict[str, Any]) -> bool:
+    dblock = d.get("discovery")
+    return isinstance(dblock, dict) and str(dblock.get("type")) == "none"
+
+
+# filter state for the compact providers list (presentation only)
+_PROV_LIST_FILTER: Dict[str, str] = {}
+
+
+def _prov_filter(adapter) -> str:
+    aid = str(id(adapter))
+    return _PROV_LIST_FILTER.get(aid, "all")
+
+
+def _prov_filter_set(adapter, mode: str) -> None:
+    _PROV_LIST_FILTER[str(id(adapter))] = mode
+
+
+def _custom_row_visible(entry: Dict[str, Any], mode: str) -> bool:
+    if mode == "task":
+        return _entry_task_only(entry)
+    if mode == "ready":
+        return bool(entry.get("enabled", True)) and _entry_has_cred(entry)
+    return True
+
+
 def screen_providers(adapter):
     rows, active_p, active_m = _provider_rows()
     lines = [_T("cpanel.prov.title", "🔑 Provider Management"), "─" * 26]
@@ -431,21 +574,29 @@ def screen_providers(adapter):
         lines.append(f"{state}{star} {r['name']} · key:{key} {r['key_masked']}")
         kb_rows.append([(r["name"], f"hctl:prov:sel:{r['name']}")])
     customs = _custom_providers()
+    lst_filter = _prov_filter(adapter)
     if customs:
         lines.append("")
         lines.append(_T("cpanel.cust.section", "🧩 Custom providers:"))
     active_route = _custom_active_route()
     for pid, e in sorted(customs.items()):
+        if not _custom_row_visible(e, lst_filter):
+            continue
         state = "🟢" if e.get("enabled") else "⚪"
         star = "⭐" if active_route == f"custom:{pid}" else ""
-        url = str(e.get("api") or e.get("base_url") or "")
-        host = re.sub(r"^(https?://[^/]+).*$", r"\1", url)
-        key_var = str(e.get("key_env") or "")
-        has_key = bool(_env_get(key_var)) if key_var else bool(e.get("api_key"))
-        lines.append(f"{state}{star} 🧩 {pid} · {host or '—'} · key:{'🔑' if has_key else '—'}")
+        proto_btn = _T("cpanel.cust.tasktag", "· task-only") if _entry_task_only(e) else ""
+        has_key = _entry_has_cred(e)
+        lines.append(f"{state}{star} 🧩 {pid}{proto_btn} · key:{'🔑' if has_key else '—'}")
+        kb_rows.append([(f"🧩 {pid}{proto_btn.replace('·', '•')}", f"hctl:cust:sel:{pid}")])
     lines += ["", _T("cpanel.prov.legend", "🟢 enabled · ⚪ disabled · ⭐ default · tap a provider for actions")]
-    for pid in sorted(_custom_providers().keys()):
-        kb_rows.append([(f"🧩 {pid}", f"hctl:cust:sel:{pid}")])
+    # presentation-level filter chips (no behavior change — only rows shown)
+    def _chip(mode: str, label: str) -> Tuple[str, str]:
+        return (("✓ " if lst_filter == mode else "") + label, f"hctl:cust:listf:{mode}")
+    kb_rows.append([
+        _chip("all", _T("cpanel.cust.filt.all", "All")),
+        _chip("ready", _T("cpanel.cust.filt.ready", "Ready")),
+        _chip("task", _T("cpanel.cust.filt.task", "Task-only")),
+    ])
     kb_rows.append([("➕ " + _T("cpanel.prov.add", "Add Provider"), "hctl:add:start")])
     kb = _kb(adapter, kb_rows + [[("◀️ " + _T("cpanel.back", "Back"), "hctl:main")]])
     return "\n".join(lines)[:_MAX_TEXT], kb
@@ -845,23 +996,40 @@ def screen_custom_detail(adapter, pid: str):
     state = "🟢" if e.get("enabled") else "⚪"
     star = "⭐" if _custom_active_route() == f"custom:{pid}" else ""
     dmodel = str(e.get("default_model") or "—")
-    lines = [f"🧩 {pid} {state}{star}", "─" * 26,
+    task_only = _entry_task_only(e)
+    discovery_supported = _entry_discovery_supported(e)
+    caps_label = ", ".join(_entry_effective_caps(e)) or "—"
+    if not discovery_supported:
+        discovery_line = _T("cpanel.cust.discnone", "Model discovery: Not applicable (provider does not expose a model catalog)")
+    elif _entry_caps(e):
+        discovery_line = _T("cpanel.cust.discdecl", "Model discovery: configured via declaration")
+    else:
+        discovery_line = _T("cpanel.cust.disclegacy", "Model discovery: supported (OpenAI-style GET {base}/models)")
+    lines = [f"🧩 {pid} {state}{star}" + (" · " + _T("cpanel.cust.taskbadge", "task-only") if task_only else ""), "─" * 26,
              f"{_T('cpanel.cust.baseurl', 'API base URL')}: {url}",
              f"{_T('cpanel.cust.website', 'Website (metadata only — never scraped)')}: {website}",
              f"{_T('cpanel.cust.key', 'API key')}: {mask_secret(key_val)}",
              f"{_T('cpanel.cust.dmodel', 'Default model')}: {dmodel}",
              "",
-             _T("cpanel.cust.note", "Protocol: OpenAI-compatible (chat/completions + models). Other protocols need a custom provider plugin — not invented here.")]
+             f"{_T('cpanel.cust.protocol', 'Protocol')}: {_entry_protocol_line(e)}",
+             f"{_T('cpanel.cust.authlbl', 'Auth')}: {_entry_auth_line(e)}",
+             f"{_T('cpanel.cust.caps', 'Capabilities')}: {caps_label} "
+             + (_T("cpanel.cust.capsexplicit", "(declared)") if _entry_caps(e)
+                else _T("cpanel.cust.capslegacy", "(legacy default)")),
+             discovery_line]
+    if task_only:
+        lines.append(_T("cpanel.cust.tasknote", "This provider runs tasks, not chat completions: it is not offered as a /model default."))
     cb = "hctl:cust:"
-    rows = [
-        [("🧪 " + _T("cpanel.test.go", "Test"), f"{cb}go:{pid}"),
-         ("📋 " + _T("cpanel.cust.models", "Models"), f"{cb}models:{pid}")],
-        [("⭐ " + _T("cpanel.prov.setdefault", "Set Default"), f"{cb}setdef:{pid}")],
-        [("🔄 " + _T("cpanel.cust.toggle", "Enable/Disable"), f"{cb}toggle:{pid}")],
-        [("✏️ " + _T("cpanel.cust.edit", "Edit"), f"{cb}editask:{pid}"),
-         ("🗑 " + _T("cpanel.cust.delete", "Delete"), f"{cb}delask:{pid}")],
-        [("◀️ " + _T("cpanel.back", "Back"), "hctl:prov")],
-    ]
+    first_row = [("🧪 " + _T("cpanel.test.go", "Test"), f"{cb}go:{pid}")]
+    if discovery_supported and not task_only:
+        first_row.append(("📋 " + _T("cpanel.cust.models", "Models"), f"{cb}models:{pid}"))
+    rows = [first_row]
+    if not task_only:
+        rows.append([("⭐ " + _T("cpanel.prov.setdefault", "Set Default"), f"{cb}setdef:{pid}")])
+    rows.append([("🔄 " + _T("cpanel.cust.toggle", "Enable/Disable"), f"{cb}toggle:{pid}")])
+    rows.append([("✏️ " + _T("cpanel.cust.edit", "Edit"), f"{cb}editask:{pid}"),
+                 ("🗑 " + _T("cpanel.cust.delete", "Delete"), f"{cb}delask:{pid}")])
+    rows.append([("◀️ " + _T("cpanel.back", "Back"), "hctl:prov")])
     return "\n".join(lines)[:_MAX_TEXT], _kb(adapter, rows)
 
 
@@ -1209,20 +1377,27 @@ async def handle_callback(adapter, query, data: str) -> None:
                 text, kb = screen_custom_detail(adapter, arg)
             elif op == "go" and arg:
                 await query.answer(text=_T("cpanel.test.running", "Testing…"))
-                res = run_connection_test("custom:" + arg)
-                head = f"{res.get('provider_icon','—')} {res.get('summary','')}"
-                note = _T("cpanel.test.note" + str(res.get("kind")), "")
-                note = {
-                    "quota": _T("cpanel.test.quota", "Reason: provider quota/rate limit (e.g. Google RESOURCE_EXHAUSTED). This is NOT a Hermes failure."),
-                    "auth": _T("cpanel.test.auth", "Reason: authentication failed — check the stored key."),
-                    "not_found": _T("cpanel.test.404", "Reason: endpoint not found — check base URL / models path."),
-                    "timeout": _T("cpanel.test.timeout", "Reason: connection timeout."),
-                    "network": _T("cpanel.test.net", "Reason: network failure."),
-                    "malformed": _T("cpanel.test.malformed", "Reason: response is not an OpenAI-style JSON catalog."),
-                    "no_key": _T("cpanel.test.nokey", "Reason: credential not configured."),
-                    "provider_error": _T("cpanel.test.perr", "Reason: provider-side error (5xx). Known transient capacity states are shown as-is."),
-                }.get(str(res.get("kind")), _T("cpanel.test.oknote", "Provider API reachable. (Connectivity only — not an inference check.)") if res.get("ok") else _T("cpanel.test.other", "See status code above."))
-                text = "\n".join(["🧪 " + _T("cpanel.test.result", "Test result"), "─" * 26, head, "", note])
+                e = _custom_providers().get(arg) or {}
+                key_var = str(e.get("key_env") or "")
+                if key_var:
+                    e = dict(e)
+                    e["api_key"] = _env_get(key_var) or ""
+                res = await _probe_entry(e)
+                ok = bool(res.get("ok"))
+                icon = "🟢" if ok else "🔴"
+                head = f"{icon} custom:{arg}: HTTP {res.get('http_status') or '—'} — {res.get('category', '?')}"
+                caps_line = ""
+                if res.get("capabilities"):
+                    caps_line = _T("cpanel.test.caps", "Capabilities: ") + ", ".join(res["capabilities"])
+                note = _probe_note(str(res.get("category")), ok)
+                text = "\n".join(x for x in ["🧪 " + _T("cpanel.test.result", "Test result"), "─" * 26,
+                                             head, caps_line, "", note] if x)
+                kb = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")]])
+            elif op == "listf" and arg in ("all", "ready", "task"):
+                _prov_filter_set(adapter, arg)
+                text, kb = screen_providers(adapter)
+            elif op == "models" and arg and (_entry_task_only(_custom_providers().get(arg) or {}) or not _entry_discovery_supported(_custom_providers().get(arg) or {})):
+                text = "ℹ️ " + _T("cpanel.cust.discnone", "Model discovery: Not applicable (provider does not expose a model catalog)")
                 kb = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")]])
             elif op == "models" and arg:
                 e = _custom_providers().get(arg) or {}
@@ -1244,6 +1419,10 @@ async def handle_callback(adapter, query, data: str) -> None:
                 meta = (_read_config().get("cpanel_providers_meta") or {})
                 text, kb = screen_custom_detail(adapter, arg)
                 text = f"✅ default_model = {arg2}\n\n" + text
+            elif op == "setdef" and arg and _entry_task_only(_custom_providers().get(arg) or {}):
+                # Set-Default is gated on chat capability: task-only providers are never a default route.
+                text = "🚫 " + _T("cpanel.cust.nosetdef", "This provider is task-only (no chat capability) and cannot be the default model route.")
+                kb = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")]])
             elif op == "setdef" and arg:
                 e = _custom_providers().get(arg) or {}
                 dm = str(e.get("default_model") or "")
@@ -1291,7 +1470,11 @@ async def handle_callback(adapter, query, data: str) -> None:
             pend = _pending_get(chat_id) or {"step": "", "data": {}}
             d = dict(pend.get("data") or {})
             pid_new = str(d.get("id") or "")
-            if op == "auth" and arg in ("bearer", "none"):
+            if op == "auth" and arg == "apihdr":
+                _pending_set(chat_id, "cwx", "authhdr", d)
+                text = _T("cpanel.cwx.authhdr", "Send the auth HEADER NAME (e.g. X-API-Key, X-Browser-Use-API-Key).")
+                kb = _kb(adapter, [[("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]])
+            elif op == "auth" and arg in ("bearer", "none"):
                 d["auth"] = arg
                 if arg == "bearer":
                     _pending_set(chat_id, "cwx", "key", d)
@@ -1324,29 +1507,52 @@ async def handle_callback(adapter, query, data: str) -> None:
                 text = _cwx_summary(d)
                 kb = _kb(adapter, rows)
             elif op == "save":
-                _pending_pop(chat_id)
                 pid = str(d.get("id") or "")
-                if _custom_id_ok(pid):
-                    fields = {"api": d["base_url"], "name": str(d.get("display") or pid)}
-                    if d.get("key"):
-                        var = _custom_env_var(pid)
-                        _env_write(var, d["key"])
-                        fields["key_env"] = var
-                    if d.get("default_model"):
-                        fields["default_model"] = d["default_model"]
-                    if d.get("models"):
-                        fields["models"] = {m: {} for m in d["models"][:20]}
-                        fields["models_discovered"] = True
-                    _custom_write(adapter, pid, fields)
-                    if d.get("website"):
-                        meta = dict(_read_config().get("cpanel_providers_meta") or {})
-                        meta[pid] = {"website": d["website"], "display": d.get("display") or pid}
-                        _write_config_key(adapter, "cpanel_providers_meta", meta)
-                    text, kb = screen_custom_detail(adapter, pid)
-                    text = "✅ " + _T("cpanel.add.saved", "Saved (no AI call made).") + "\n\n" + text
-                else:
+                if not _custom_id_ok(pid):
+                    _pending_pop(chat_id)
                     text, kb = screen_providers(adapter)
                     text = "⚠️ " + _T("cpanel.cust.badid", "invalid id — nothing saved") + "\n\n" + text
+                else:
+                    # TRANSACTIONAL SAVE: generic probe must succeed BEFORE anything is persisted.
+                    await query.answer(text=_T("cpanel.test.running", "Testing…"))
+                    probe_res = await _probe_entry(_wizard_probe_entry(d))
+                    if not probe_res.get("ok"):
+                        # NOTHING was saved — keep the pending state so the user can retry.
+                        _pending_set(chat_id, "cwx", "confirm", d)
+                        head = f"🔴 {probe_res.get('category', '?')} (HTTP {probe_res.get('http_status') or '—'})"
+                        rows = [[("🔁 " + _T("cpanel.cwx.testagain", "Re-test & save"), "hctl:cwx:save")],
+                                [("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:new")],
+                                [("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]]
+                        text = "⚠️ " + _T("cpanel.cwx.saveblocked", "Probe failed — provider was NOT saved:") \
+                            + f"\n{head}\n" + _probe_note(str(probe_res.get("category")), False) \
+                            + "\n\n" + _cwx_summary(d)
+                        kb = _kb(adapter, rows)
+                    else:
+                        _pending_pop(chat_id)
+                        fields = {"api": d["base_url"], "name": str(d.get("display") or pid)}
+                        if str(d.get("auth") or "bearer") != "bearer":
+                            fields["auth"] = {"type": d["auth"]}
+                            if d["auth"] == "api_key_header" and d.get("auth_header"):
+                                fields["auth"]["header"] = str(d["auth_header"])
+                        for block in ("probe", "discovery", "runtime", "provider_capabilities"):
+                            if d.get(block):
+                                fields[block] = d[block]
+                        if d.get("key"):
+                            var = _custom_env_var(pid)
+                            _env_write(var, d["key"])
+                            fields["key_env"] = var
+                        if d.get("default_model"):
+                            fields["default_model"] = d["default_model"]
+                        if d.get("models"):
+                            fields["models"] = {m: {} for m in d["models"][:20]}
+                            fields["models_discovered"] = True
+                        _custom_write(adapter, pid, fields)
+                        if d.get("website"):
+                            meta = dict(_read_config().get("cpanel_providers_meta") or {})
+                            meta[pid] = {"website": d["website"], "display": d.get("display") or pid}
+                            _write_config_key(adapter, "cpanel_providers_meta", meta)
+                        text, kb = screen_custom_detail(adapter, pid)
+                        text = "✅ " + _T("cpanel.cwx.testsaved", "Probe OK — saved.") + "\n\n" + text
             elif op == "eb" and arg:
                 _pending_set(chat_id, "cwx", "basedit", {"id": arg})
                 text = _cwx_steps_text("base", {})
@@ -1556,6 +1762,16 @@ async def consume_pending_input(adapter, update, context) -> bool:
             _pending_set(chat_id, "cwx", "website", d)
             await _say_text(_cwx_steps_text("website", d), cancel_kb)
             return True
+        if step == "authhdr":
+            hdr = re.sub(r"[^A-Za-z0-9-]", "", raw)[:64]
+            if not hdr or not hdr[0].isalpha():
+                await _say_text("⚠️ " + _T("cpanel.cust.badheader", "invalid header name (letters/digits/dash, starting with a letter)"), cancel_kb)
+                return True
+            d["auth"] = "api_key_header"
+            d["auth_header"] = hdr
+            _pending_set(chat_id, "cwx", "key", d)
+            await _say_text(_cwx_steps_text("key", d), cancel_kb)
+            return True
         if step in ("website", "webedit"):
             website = "" if raw in ("-", "—") else raw
             ok = (not website) or bool(re.match(r"^https?://[^@/\s]+", website))
@@ -1592,15 +1808,28 @@ async def consume_pending_input(adapter, update, context) -> bool:
                 d["base_url"] = url
                 _pending_set(chat_id, "cwx", "auth", d)
                 rows = [[("🔑 " + _T("cpanel.cust.bearer", "API key (Bearer)"), "hctl:cwx:auth:bearer")],
+                        [("🏷 " + _T("cpanel.cust.authhdr", "API key in a custom header (e.g. X-API-Key)"), "hctl:cwx:auth:apihdr")],
                         [("🆓 " + _T("cpanel.cust.noauth", "No auth (open/local endpoint)"), "hctl:cwx:auth:none")],
                         [("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]]
                 await _say_text(_cwx_steps_text("auth", d), _kb(adapter, rows))
             else:
+                # base URL edit is transactional: probe the NEW endpoint with the stored
+                # credential BEFORE touching config; on failure the old config stands.
                 pid = str(d.get("id") or "")
-                _write_config_key(adapter, f"providers.{pid}.api", url)
+                e = dict(_custom_providers().get(pid) or {})
+                key_var0 = str(e.get("key_env") or "")
+                e["api_key"] = (_env_get(key_var0) if key_var0 else e.get("api_key")) or ""
+                e["base_url"] = url
+                e.pop("api", None)
+                trial = await _probe_entry(e)
+                if not trial.get("ok"):
+                    head = f"🔴 {trial.get('category', '?')} (HTTP {trial.get('http_status') or '—'})"
+                    await _say_text("⚠️ " + _T("cpanel.cwx.editblocked", "Probe failed — existing config kept unchanged:") + f"\n{head}\n" + _probe_note(str(trial.get("category")), False), cancel_kb)
+                    return True
                 _pending_pop(chat_id)
+                _write_config_key(adapter, f"providers.{pid}.api", url)
                 txt, kb2 = screen_custom_detail(adapter, pid)
-                await _say_text("✅\n\n" + txt, kb2)
+                await _say_text("✅ " + _T("cpanel.cwx.testsaved", "Probe OK — saved.") + "\n\n" + txt, kb2)
             return True
         if step in ("key", "keyedit"):
             key = "" if raw in ("-", "—") else raw
@@ -1610,17 +1839,35 @@ async def consume_pending_input(adapter, update, context) -> bool:
             d["key"] = key
             d["key_masked"] = mask_secret(key) if key else "—"
             if step == "keyedit":
+                # Key rotation is transactional too: validate the NEW secret with a real
+                # probe FIRST — a never-validated secret is never persisted.
                 pid = str(d.get("id") or "")
-                e = _custom_providers().get(pid) or {}
-                var = str(e.get("key_env") or "") or _custom_env_var(pid)
+                e = dict(_custom_providers().get(pid) or {})
+                e["api_key"] = key
+                key_var0 = str(e.get("key_env") or "")
+                if not key_var0:
+                    e.pop("key_env", None)
+                trial = await _probe_entry(e)
+                if not trial.get("ok"):
+                    head = f"🔴 {trial.get('category', '?')} (HTTP {trial.get('http_status') or '—'})"
+                    await _say_text("⚠️ " + _T("cpanel.cwx.keyblocked", "Probe failed — the new key was NOT stored:") + f"\n{head}\n" + _probe_note(str(trial.get("category")), False), cancel_kb)
+                    return True
+                var = key_var0 or _custom_env_var(pid)
                 _env_write(var, key if key else None)
                 if key:
                     _write_config_key(adapter, f"providers.{pid}.key_env", var)
                 _pending_pop(chat_id)
                 txt, kb2 = screen_custom_detail(adapter, pid)
-                await _say_text("✅\n\n" + txt, kb2)
+                await _say_text("✅ " + _T("cpanel.cwx.keysaved", "Probe OK — key rotated (stored locally, masked).") + "\n\n" + txt, kb2)
                 return True
             base = str(d.get("base_url") or "")
+            if _pending_nearby_declared_nodiscovery(d):
+                d["models"] = []
+                _pending_set(chat_id, "cwx", "confirm", d)
+                rows = [[("💾 " + _T("cpanel.save", "Save"), "hctl:cwx:save")],
+                        [("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]]
+                await _say_text("ℹ️ " + _T("cpanel.cust.discnone", "Model discovery: Not applicable (provider does not expose a model catalog)") + "\n\n" + _cwx_summary(d), _kb(adapter, rows))
+                return True
             ids, kindd = discover_models(base, "", key or None)
             d["models"] = ids or []
             if ids:
