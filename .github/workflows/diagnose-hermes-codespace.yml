@@ -1,4 +1,4 @@
-name: canonical-repo-migration-finalize2
+name: canonical-repo-migration-finalize3
 on:
   workflow_dispatch:
 jobs:
@@ -43,11 +43,11 @@ jobs:
           g remote get-url origin | grep -q 'github.com/VELORATRADEHQ/hermes-agent.git' || { echo "STOP ORIGIN_WRONG"; exit 9; }
           g config http.postBuffer 1073741824
           echo "--- pushing $(g rev-parse --short HEAD) to origin/main (no force)..."
-          if ! g -c http.extraheader="Authorization: Bearer ${PUSH_TOK}" push origin main 2>&1 | mask; then
+          if ! g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" push origin main 2>&1 | mask; then
             echo "STOP PUSH_REJECTED"; exit 10
           fi
           sleep 5
-          RSHA=$(g -c http.extraheader="Authorization: Bearer ${PUSH_TOK}" ls-remote origin refs/heads/main | awk '{print $1}')
+          RSHA=$(g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" ls-remote origin refs/heads/main | awk '{print $1}')
           LSHA=$(g rev-parse HEAD)
           echo "local HEAD:  $LSHA"; echo "remote main: $RSHA"
           [ "$RSHA" = "$LSHA" ] || { echo "STOP LSREMOTE_MISMATCH local=$LSHA remote=$RSHA"; exit 11; }
