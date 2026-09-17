@@ -106,6 +106,65 @@ def _env_get(name: str) -> Optional[str]:
             return v
     return None
 
+def _custom_providers() -> Dict[str, Dict[str, Any]]:
+    """config.yaml ``providers:`` map — the NATIVE custom-provider shape (v12).
+
+    Never invents a parallel abstraction: these entries feed
+    hermes_cli.config_providers.get_compatible_custom_providers() at runtime."""
+    cfg = _read_config()
+    raw = cfg.get("providers")
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, entry in raw.items():
+        if isinstance(entry, dict):
+            e = dict(entry)
+            e["_key"] = str(key)
+            e["enabled"] = entry.get("enabled", True) is not False
+            out[str(key)] = e
+    return out
+
+
+def _custom_id_ok(pid: str) -> bool:
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,19}", pid or ""))
+
+
+def _custom_url_ok(url: str) -> Tuple[bool, str]:
+    u = (url or "").strip()
+    if not u or any(ch.isspace() for ch in u):
+        return False, "empty/whitespace"
+    m = re.match(r"^(https?)://([^@\s/]+(?:/[^\s]*)?)$", u)
+    if not m or "@" in u:
+        return False, "must be https://host[/path] without userinfo"
+    scheme, rest = m.group(1), m.group(2)
+    host = rest.split("/")[0].split(":")[0].lower()
+    if scheme == "http" and host not in ("localhost", "127.0.0.1", "::1") and not host.endswith(".local"):
+        return False, "http only allowed for localhost"
+    return True, host
+
+
+def _custom_env_var(pid: str) -> str:
+    return "CUSTOM_" + pid.upper().replace("-", "_")[:16] + "_API_KEY"
+
+
+def _custom_write(adapter, pid: str, fields: Dict[str, Any]) -> None:
+    """Write the native providers.<pid> mapping (dotted leaves; id slug forbids dots)."""
+    for leaf, value in fields.items():
+        _write_config_key(adapter, f"providers.{pid}.{leaf}", value)
+
+
+def _custom_delete(adapter, pid: str) -> None:
+    cfg = _read_config()
+    prov = dict(cfg.get("providers") or {})
+    prov.pop(pid, None)
+    leaf_ok = _write_config_key(adapter, "providers", prov)
+
+
+def _custom_active_route() -> str:
+    cfg = _read_config()
+    return str(((cfg.get("model") or {}).get("provider")) or "")
+
+
 def _first_set_env(env_vars: Tuple[str, ...]) -> Tuple[str, Optional[str]]:
     """Return (var_name, value) of the first credential var that is actually set.
 
@@ -154,6 +213,111 @@ def _env_write(name: str, value: Optional[str]) -> bool:
     except Exception as exc:
         logger.error("cpanel env write failed: %s", exc)
         return False
+
+# ── persistent control state (per-chat attach markers; never stores secrets) ──
+
+def _ui_state_path() -> Path:
+    return _home() / "state" / "cpanel-ui.json"
+
+
+def _ui_state_read() -> Dict[str, Any]:
+    try:
+        return json.loads(_ui_state_path().read_text() or "{}")
+    except Exception:
+        return {}
+
+
+def _ui_state_write(data: Dict[str, Any]) -> None:
+    p = _ui_state_path()
+    p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="cpanel-ui.", dir=str(p.parent))
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(data))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+    with suppress_exc():
+        os.chmod(p, 0o600)
+
+
+def suppress_exc():
+    import contextlib
+    return contextlib.suppress(Exception)
+
+
+def _persist_mark(chat_id: str) -> None:
+    st = _ui_state_read()
+    st.setdefault("persist", {})[str(chat_id)] = time.time()
+    _ui_state_write(st)
+
+
+def _persist_unmark(chat_id: str) -> bool:
+    st = _ui_state_read()
+    if str(chat_id) in st.get("persist", {}):
+        st["persist"].pop(str(chat_id), None)
+        _ui_state_write(st)
+        return True
+    return False
+
+
+def _persist_ts(chat_id: str) -> float:
+    try:
+        return float(_ui_state_read().get("persist", {}).get(str(chat_id), 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def _persist_label() -> str:
+    return _T("cpanel.persist.button", "🎛 Control Panel")
+
+
+def _persist_labels_all() -> List[str]:
+    """Every localized form of the persistent button label — tapping must work after a
+    language switch too. Hard-configured locales only (en + fa ship with the panel)."""
+    out = {_T("cpanel.persist.button", "🎛 Control Panel"), "🎛 Control Panel", "🎛 پنل مدیریت"}
+    return [x for x in out if x.strip()]
+
+
+def _persist_keyboard(adapter):
+    """Persistent ReplyKeyboard with one localized button. UI sugar ONLY — never auth."""
+    try:
+        from telegram import ReplyKeyboardMarkup, KeyboardButton
+    except Exception:
+        return None
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(_persist_label())]], resize_keyboard=True, is_persistent=True)
+
+
+def _persist_remove(adapter):
+    try:
+        from telegram import ReplyKeyboardRemove
+    except Exception:
+        return None
+    return ReplyKeyboardRemove()
+
+
+async def _persist_attach(adapter, chat_id: str, thread_id=None) -> None:
+    """(Re)attach the persistent button with a minimal note; idempotent via marker TTL."""
+    note = _T("cpanel.persist.ready", "🎛 Quick access pinned below — tap it anytime.")
+    try:
+        sender = getattr(adapter, "_send_control_message", None)
+        if callable(sender):
+            await sender(str(chat_id), note, parse_mode=None, thread_id=thread_id,
+                         metadata=None, reply_markup=_persist_keyboard(adapter))
+            _persist_mark(str(chat_id))
+    except Exception as exc:
+        logger.warning("cpanel persist attach failed: %s", scrub_text(str(exc)))
+
+
+async def _persist_detach(adapter, chat_id: str, thread_id=None) -> None:
+    note = _T("cpanel.persist.removed", "Quick access removed.")
+    try:
+        sender = getattr(adapter, "_send_control_message", None)
+        if callable(sender):
+            await sender(str(chat_id), note, parse_mode=None, thread_id=thread_id,
+                         metadata=None, reply_markup=_persist_remove(adapter))
+    except Exception as exc:
+        logger.warning("cpanel persist detach failed: %s", scrub_text(str(exc)))
+
 
 # ── credential masking (never render full secrets) ────────────────────────────
 
@@ -266,7 +430,22 @@ def screen_providers(adapter):
         key = "🔑" if r["has_key"] else "—"
         lines.append(f"{state}{star} {r['name']} · key:{key} {r['key_masked']}")
         kb_rows.append([(r["name"], f"hctl:prov:sel:{r['name']}")])
+    customs = _custom_providers()
+    if customs:
+        lines.append("")
+        lines.append(_T("cpanel.cust.section", "🧩 Custom providers:"))
+    active_route = _custom_active_route()
+    for pid, e in sorted(customs.items()):
+        state = "🟢" if e.get("enabled") else "⚪"
+        star = "⭐" if active_route == f"custom:{pid}" else ""
+        url = str(e.get("api") or e.get("base_url") or "")
+        host = re.sub(r"^(https?://[^/]+).*$", r"\1", url)
+        key_var = str(e.get("key_env") or "")
+        has_key = bool(_env_get(key_var)) if key_var else bool(e.get("api_key"))
+        lines.append(f"{state}{star} 🧩 {pid} · {host or '—'} · key:{'🔑' if has_key else '—'}")
     lines += ["", _T("cpanel.prov.legend", "🟢 enabled · ⚪ disabled · ⭐ default · tap a provider for actions")]
+    for pid in sorted(_custom_providers().keys()):
+        kb_rows.append([(f"🧩 {pid}", f"hctl:cust:sel:{pid}")])
     kb_rows.append([("➕ " + _T("cpanel.prov.add", "Add Provider"), "hctl:add:start")])
     kb = _kb(adapter, kb_rows + [[("◀️ " + _T("cpanel.back", "Back"), "hctl:main")]])
     return "\n".join(lines)[:_MAX_TEXT], kb
@@ -502,25 +681,39 @@ def _save_test(res: Dict[str, Any]) -> None:
 
 def run_connection_test(provider_name: str) -> Dict[str, Any]:
     """Explicit connectivity probe for ONE provider. No inference. No retries."""
-    prof = _profiles().get(provider_name)
     ts = time.time()
-    if not prof:
-        return {"ok": False, "kind": "unknown_provider", "provider": provider_name, "ts": ts}
-    env_vars = tuple(getattr(prof, "env_vars", ()) or ())
-    key_var_used, key = _first_set_env(env_vars)
-    base_url = (getattr(prof, "base_url", "") or "").rstrip("/")
-    models_url = getattr(prof, "models_url", "") or (base_url + "/models" if base_url else "")
+    if provider_name.startswith("custom:"):
+        pid = provider_name.split(":", 1)[1]
+        entry = _custom_providers().get(pid)
+        if not entry:
+            return {"ok": False, "kind": "unknown_provider", "provider": provider_name, "ts": ts}
+        key_var_used = "key"
+        key = _env_get((entry.get("key_env") or "")) if entry.get("key_env") else (entry.get("api_key") or None)
+        base_url = str(entry.get("api") or entry.get("base_url") or "").rstrip("/")
+        models_url = str(entry.get("models_url") or "") or (base_url + "/models" if base_url else "")
+        pname = "custom:" + pid
+        auth_type = "api_key" if entry.get("key_env") or entry.get("api_key") else "none"
+        ename = pid
+    else:
+        prof = _profiles().get(provider_name)
+        if not prof:
+            return {"ok": False, "kind": "unknown_provider", "provider": provider_name, "ts": ts}
+        env_vars = tuple(getattr(prof, "env_vars", ()) or ())
+        key_var_used, key = _first_set_env(env_vars)
+        base_url = (getattr(prof, "base_url", "") or "").rstrip("/")
+        models_url = getattr(prof, "models_url", "") or (base_url + "/models" if base_url else "")
+        pname = provider_name.lower()
+        auth_type = str(getattr(prof, "auth_type", "api_key"))
+        ename = provider_name
     if not base_url and not models_url:
-        res = {"ok": None, "kind": "unsupported", "reason": "no HTTP models endpoint for this provider", "provider": provider_name, "ts": ts}
+        res = {"ok": None, "kind": "unsupported", "reason": "no HTTP models endpoint for this provider", "provider": ename, "ts": ts}
         _save_test(_decorate(res)); return res
     host = re.sub(r"^(https?://[^/]+).*$", r"\1", models_url or base_url)
-    if env_vars and not key:
-        res = {"ok": False, "kind": "no_key", "reason": f"credential {env_vars[0]} not configured", "provider": provider_name, "ts": ts}
+    if auth_type == "api_key" and not key:
+        res = {"ok": False, "kind": "no_key", "reason": "credential not configured", "provider": ename, "ts": ts}
         _save_test(_decorate(res)); return res
     headers: Dict[str, str] = {}
     url = models_url
-    auth_type = str(getattr(prof, "auth_type", "api_key"))
-    pname = provider_name.lower()
     if key and ("google" in pname or "gemini" in pname):
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}key={key}"
@@ -534,8 +727,17 @@ def run_connection_test(provider_name: str) -> Dict[str, Any]:
         code = resp.status_code
         if 200 <= code < 300:
             res = {"ok": True, "kind": "success", "http": code, "provider": provider_name, "host": host, "ts": ts}
+            try:
+                payload = resp.json()
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, list):
+                    res["count"] = len(data)
+            except Exception:
+                pass
         elif code in (401, 403):
             res = {"ok": False, "kind": "auth", "http": code, "provider": provider_name, "host": host, "ts": ts}
+        elif code == 404:
+            res = {"ok": False, "kind": "not_found", "http": code, "provider": provider_name, "host": host, "ts": ts, "detail": "endpoint mismatch (check models URL / base path)"}
         elif code == 429:
             res = {"ok": False, "kind": "quota", "http": code, "provider": provider_name, "host": host, "ts": ts, "detail": "RESOURCE_EXHAUSTED / rate limit"}
         elif 500 <= code < 600:
@@ -543,11 +745,61 @@ def run_connection_test(provider_name: str) -> Dict[str, Any]:
         else:
             res = {"ok": False, "kind": "other", "http": code, "provider": provider_name, "host": host, "ts": ts}
     except Exception as exc:
-        res = {"ok": False, "kind": "network", "provider": provider_name, "host": host, "ts": ts,
+        kind_exc = "timeout" if "Timeout" in type(exc).__name__ or "timeout" in type(exc).__name__.lower() else "network"
+        res = {"ok": False, "kind": kind_exc, "provider": provider_name, "host": host, "ts": ts,
                "detail": scrub_text(type(exc).__name__)}
     decorated = _decorate(res)
     _save_test(decorated)
     return decorated
+
+def discover_models(base_url: str, models_url: str, key: Optional[str], timeout_s: float = _TEST_TIMEOUT_S) -> Tuple[Optional[List[str]], str]:
+    """GET the models endpoint, parse the OpenAI-style catalog. Returns (ids|None, kind).
+
+    kinds: success | auth | quota | not_found | timeout | network | malformed | no_key
+    Never logs the key; only the endpoint URL is touched — no website scraping, ever."""
+    base_url = (base_url or "").strip().rstrip("/")
+    url = (models_url or "").strip() or (base_url + "/models" if base_url else "")
+    if not url:
+        return None, "unsupported"
+    headers = {"User-Agent": "hermes-cpanel/1.0"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        import httpx
+        with httpx.Client(timeout=timeout_s, follow_redirects=False) as cli:
+            resp = cli.get(url, headers=headers)
+        code = resp.status_code
+        if code in (401, 403):
+            return None, "auth"
+        if code == 404:
+            return None, "not_found"
+        if code == 429:
+            return None, "quota"
+        if code >= 500:
+            return None, "provider_error"
+        if not (200 <= code < 300):
+            return None, "other"
+        try:
+            data = resp.json()
+        except Exception:
+            return None, "malformed"
+        ids: List[str] = []
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            for item in data["data"]:
+                if isinstance(item, dict) and item.get("id"):
+                    ids.append(str(item["id"]))
+                elif isinstance(item, str):
+                    ids.append(item)
+        elif isinstance(data, list):
+            ids = [str(x.get("id")) for x in data if isinstance(x, dict) and x.get("id")] or [str(x) for x in data if isinstance(x, str)]
+        if not ids:
+            return None, "malformed"
+        return sorted(set(ids))[:100], "success"
+    except Exception as exc:
+        kind_exc = "timeout" if "timeout" in type(exc).__name__.lower() else "network"
+        logger.info("cpanel discover failed: %s", type(exc).__name__)
+        return None, kind_exc
+
 
 def _decorate(res: Dict[str, Any]) -> Dict[str, Any]:
     kind = res.get("kind")
@@ -558,12 +810,18 @@ def _decorate(res: Dict[str, Any]) -> Dict[str, Any]:
         icon, summary = "🔴", f"{prov}: authentication failed (HTTP {res.get('http')})"
     elif kind == "quota":
         icon, summary = "🔴", f"{prov}: quota/rate limit (HTTP 429)"
+    elif kind == "timeout":
+        icon, summary = "🔴", f"{prov}: connection timeout"
     elif kind == "network":
         icon, summary = "🔴", f"{prov}: network failure ({res.get('detail', '')})".strip()
     elif kind == "no_key":
         icon, summary = "🔴", f"{prov}: no credential configured"
     elif kind == "unsupported":
         icon, summary = "—", f"{prov}: connectivity test unsupported for this provider type"
+    elif kind == "not_found":
+        icon, summary = "🔴", f"{prov}: endpoint not found (HTTP 404)"
+    elif kind == "malformed":
+        icon, summary = "🔴", f"{prov}: malformed response (not an OpenAI-style JSON catalog)"
     elif kind == "provider_error":
         icon, summary = "🔴", f"{prov}: provider error (HTTP {res.get('http')})"
     else:
@@ -576,13 +834,74 @@ def _decorate(res: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── flows (add provider wizard) ───────────────────────────────────────────────
 
+def screen_custom_detail(adapter, pid: str):
+    e = _custom_providers().get(pid)
+    if not e:
+        return _T("cpanel.cust.gone", "Provider not found (maybe deleted)."), _back_cancel(adapter, "hctl:prov")
+    url = str(e.get("api") or e.get("base_url") or "—")
+    website = str(e.get("website") or "—")
+    key_var = str(e.get("key_env") or "")
+    key_val = _env_get(key_var) if key_var else (e.get("api_key") if e.get("api_key") else None)
+    state = "🟢" if e.get("enabled") else "⚪"
+    star = "⭐" if _custom_active_route() == f"custom:{pid}" else ""
+    dmodel = str(e.get("default_model") or "—")
+    lines = [f"🧩 {pid} {state}{star}", "─" * 26,
+             f"{_T('cpanel.cust.baseurl', 'API base URL')}: {url}",
+             f"{_T('cpanel.cust.website', 'Website (metadata only — never scraped)')}: {website}",
+             f"{_T('cpanel.cust.key', 'API key')}: {mask_secret(key_val)}",
+             f"{_T('cpanel.cust.dmodel', 'Default model')}: {dmodel}",
+             "",
+             _T("cpanel.cust.note", "Protocol: OpenAI-compatible (chat/completions + models). Other protocols need a custom provider plugin — not invented here.")]
+    cb = "hctl:cust:"
+    rows = [
+        [("🧪 " + _T("cpanel.test.go", "Test"), f"{cb}go:{pid}"),
+         ("📋 " + _T("cpanel.cust.models", "Models"), f"{cb}models:{pid}")],
+        [("⭐ " + _T("cpanel.prov.setdefault", "Set Default"), f"{cb}setdef:{pid}")],
+        [("🔄 " + _T("cpanel.cust.toggle", "Enable/Disable"), f"{cb}toggle:{pid}")],
+        [("✏️ " + _T("cpanel.cust.edit", "Edit"), f"{cb}editask:{pid}"),
+         ("🗑 " + _T("cpanel.cust.delete", "Delete"), f"{cb}delask:{pid}")],
+        [("◀️ " + _T("cpanel.back", "Back"), "hctl:prov")],
+    ]
+    return "\n".join(lines)[:_MAX_TEXT], _kb(adapter, rows)
+
+
+def _cwx_steps_text(step: str, d: Dict[str, Any]) -> str:
+    prompts = {
+        "id": _T("cpanel.cwx.id", "Send a short provider id (a-z, 0-9, dash). e.g. acme-llm"),
+        "display": _T("cpanel.cwx.display", "Send a display name (shown in the panel)."),
+        "website": _T("cpanel.cwx.website", "Send the provider WEBSITE url (metadata only; '-' to skip). API calls use the base URL, never the website."),
+        "base": _T("cpanel.cwx.base", "Send the API BASE URL (e.g. https://api.provider.example/v1)."),
+        "auth": _T("cpanel.cwx.auth", "Choose auth type:"),
+        "key": _T("cpanel.cwx.key", "Send the API key now (stored locally 600, shown masked, your message is deleted). '-' for no key."),
+        "basedit": _T("cpanel.cwx.base", "Send the new API BASE URL."),
+        "webedit": _T("cpanel.cwx.website", "Send the new website url ('-' to clear)."),
+        "keyedit": _T("cpanel.cwx.keyedit", "Send the new API key (rotated; old value is replaced)."),
+    }
+    return prompts.get(step, "")
+
+
+def _cwx_summary(d: Dict[str, Any], extra: str = "") -> str:
+    rows = [_T("cpanel.cwx.review", "Review — nothing sent to AI:"), "─" * 26,
+            f"id: {d.get('id')}", f"name: {d.get('display')}",
+            f"website: {d.get('website') or '—'}",
+            f"base_url: {d.get('base_url')}",
+            f"auth: {d.get('auth')}",
+            f"key: {d.get('key_masked', '—')}",
+            f"models: {', '.join((d.get('models') or [])[:4]) or '—'}",
+            f"default_model: {d.get('default_model') or '—'}"]
+    if extra:
+        rows.insert(0, extra)
+    return "\n".join(rows)
+
+
 def _add_start(adapter):
     profs = list(_profiles().keys())
     rows = []
     labels = {"gemini": "Google Gemini", "google": "Google Gemini", "openai": "OpenAI", "anthropic": "Anthropic"}
+    rows.append([("🧩 " + _T("cpanel.cust.addbtn", "Custom (OpenAI-compatible)"), "hctl:cust:new")])
     for name in profs:
         disp = labels.get(name, name)
-        rows.append([(disp, f"hctl:add:pick:{name}")][:1] if False else [(disp, f"hctl:add:pick:{name}")])
+        rows.append([(disp, f"hctl:add:pick:{name}")])
     kb_rows = rows + [[("◀️ " + _T("cpanel.back", "Back"), "hctl:prov")]]
     text = "\n".join([ _T("cpanel.add.title", "➕ Add Provider"), "─" * 26,
                        _T("cpanel.add.pick", "Choose provider type (only providers Hermes actually supports are listed):")])
@@ -700,17 +1019,30 @@ async def handle_start_command(adapter, update, context) -> None:
     welcome = _T("cpanel.start.welcome", "🛡️ Hermes is running. Choose an option:")
     if name:
         welcome = f"{name} — {welcome}"
-    kb = None
-    if kind == "admin":
-        kb = _kb(adapter, [[(_T("cpanel.start.panel_button", "🎛 Control Panel"), "hctl:main")]])
     chat_id = str(getattr(msg, "chat_id", "") or uid)
     thread_id = getattr(msg, "message_thread_id", None)
+    if kind == "admin":
+        # Persistent ReplyKeyboard: the visible, always-available panel control.
+        # (No inline twin: the tap below routes into the same panel; see consume_pending_input.)
+        kb = _persist_keyboard(adapter)
+        try:
+            sender = getattr(adapter, "_send_control_message", None)
+            if callable(sender):
+                await sender(chat_id, welcome, parse_mode=None, thread_id=thread_id, metadata=None, reply_markup=kb)
+                _persist_mark(chat_id)
+            else:
+                await msg.reply_text(welcome, reply_markup=kb)
+                _persist_mark(chat_id)
+        except Exception as exc:
+            logger.warning("cpanel start menu send failed: %s", scrub_text(str(exc)))
+        return
+    # authorized non-admin: plain welcome, NO admin button (UI sugar only; routes re-check)
     try:
         sender = getattr(adapter, "_send_control_message", None)
         if callable(sender):
-            await sender(chat_id, welcome, parse_mode=None, thread_id=thread_id, metadata=None, reply_markup=kb)
+            await sender(chat_id, welcome, parse_mode=None, thread_id=thread_id, metadata=None, reply_markup=None)
         else:
-            await msg.reply_text(welcome, reply_markup=kb)
+            await msg.reply_text(welcome)
     except Exception as exc:
         logger.warning("cpanel start menu send failed: %s", scrub_text(str(exc)))
 
@@ -839,7 +1171,7 @@ async def handle_callback(adapter, query, data: str) -> None:
             if op == "sel" and arg:
                 text, kb = screen_test(adapter, arg)
             elif op == "go" and arg:
-                await query.answer(_T("cpanel.test.running", "Testing…"))
+                await query.answer(text=_T("cpanel.test.running", "Testing…"))
                 res = run_connection_test(arg)
                 dur = time.time() - res.get("ts", time.time())
                 head = f"{res.get('provider_icon','—')} {res.get('summary','')}"
@@ -862,6 +1194,177 @@ async def handle_callback(adapter, query, data: str) -> None:
                 kb = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), "hctl:test:sel:" + arg)]])
             else:
                 text, kb = screen_test(adapter)
+        elif screen == "cust":
+            if op == "new":
+                _pending_set(chat_id, "cwx", "id", {"id": "", "display": "", "website": "", "base_url": "",
+                                                    "auth": "bearer", "key": "", "key_masked": "—",
+                                                    "models": [], "default_model": ""})
+                text = "🧩 " + _T("cpanel.cust.wiz", "New custom provider (OpenAI-compatible). Cancel anytime with the button below.") + "\n\n" + _cwx_steps_text("id", {})
+                kb = _kb(adapter, [[("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]])
+            elif op == "cancel":
+                _pending_pop(chat_id)
+                text, kb = screen_providers(adapter)
+                text = "❌ " + _T("cpanel.cancel", "Cancel") + "\n\n" + text
+            elif op == "sel" and arg:
+                text, kb = screen_custom_detail(adapter, arg)
+            elif op == "go" and arg:
+                await query.answer(text=_T("cpanel.test.running", "Testing…"))
+                res = run_connection_test("custom:" + arg)
+                head = f"{res.get('provider_icon','—')} {res.get('summary','')}"
+                note = _T("cpanel.test.note" + str(res.get("kind")), "")
+                note = {
+                    "quota": _T("cpanel.test.quota", "Reason: provider quota/rate limit (e.g. Google RESOURCE_EXHAUSTED). This is NOT a Hermes failure."),
+                    "auth": _T("cpanel.test.auth", "Reason: authentication failed — check the stored key."),
+                    "not_found": _T("cpanel.test.404", "Reason: endpoint not found — check base URL / models path."),
+                    "timeout": _T("cpanel.test.timeout", "Reason: connection timeout."),
+                    "network": _T("cpanel.test.net", "Reason: network failure."),
+                    "malformed": _T("cpanel.test.malformed", "Reason: response is not an OpenAI-style JSON catalog."),
+                    "no_key": _T("cpanel.test.nokey", "Reason: credential not configured."),
+                    "provider_error": _T("cpanel.test.perr", "Reason: provider-side error (5xx). Known transient capacity states are shown as-is."),
+                }.get(str(res.get("kind")), _T("cpanel.test.oknote", "Provider API reachable. (Connectivity only — not an inference check.)") if res.get("ok") else _T("cpanel.test.other", "See status code above."))
+                text = "\n".join(["🧪 " + _T("cpanel.test.result", "Test result"), "─" * 26, head, "", note])
+                kb = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")]])
+            elif op == "models" and arg:
+                e = _custom_providers().get(arg) or {}
+                base = str(e.get("api") or e.get("base_url") or "")
+                key = _env_get(str(e.get("key_env") or "")) if e.get("key_env") else e.get("api_key")
+                await query.answer(text=_T("cpanel.cust.discovering", "Discovering models…"))
+                ids, kindd = discover_models(base, str(e.get("models_url") or ""), key)
+                if ids:
+                    rows = [[(m[:50], f"hctl:cust:setmodel:{arg}:{m[:30]}")] for m in ids[:8]]
+                    rows.append([("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")])
+                    text = "\n".join([f"📋 {arg} — {_T('cpanel.cust.found', 'models found')}: {len(ids)}", "─" * 26] + ids[:12])
+                    kb = _kb(adapter, rows)
+                else:
+                    text = "\n".join([f"📋 {arg}", "─" * 26, _T("cpanel.cust.nodisc", "Discovery failed: ") + kindd])
+                    kb = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")]])
+            elif op == "setmodel" and arg and arg2:
+                _write_config_key(adapter, f"providers.{arg}.default_model", arg2)
+                e = _custom_providers().get(arg) or {}
+                meta = (_read_config().get("cpanel_providers_meta") or {})
+                text, kb = screen_custom_detail(adapter, arg)
+                text = f"✅ default_model = {arg2}\n\n" + text
+            elif op == "setdef" and arg:
+                e = _custom_providers().get(arg) or {}
+                dm = str(e.get("default_model") or "")
+                if not dm:
+                    text = _T("cpanel.cust.needmodel", "Pick a default model first (Models → choose).")
+                    kb = _kb(adapter, [[("📋 Models", f"hctl:cust:models:{arg}")],
+                                       [("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")]])
+                else:
+                    _write_config_key(adapter, "model.provider", f"custom:{arg}")
+                    _write_config_key(adapter, "model.default", dm)
+                    text, kb = screen_custom_detail(adapter, arg)
+                    text = f"⭐ default route = custom:{arg} / {dm}\n\n" + text
+            elif op == "toggle" and arg:
+                e = _custom_providers().get(arg) or {}
+                _write_config_key(adapter, f"providers.{arg}.enabled", not e.get("enabled", True))
+                text, kb = screen_custom_detail(adapter, arg)
+                text = ("✅ enabled" if not e.get("enabled", True) else "⚪ disabled") + "\n\n" + text
+            elif op == "editask" and arg:
+                rows = [
+                    [(_T("cpanel.cust.ebase", "✏️ Change base URL"), f"hctl:cwx:eb:{arg}")],
+                    [(_T("cpanel.cust.eweb", "✏️ Change website (metadata)"), f"hctl:cwx:ew:{arg}")],
+                    [(_T("cpanel.cust.ekey", "🔑 Rotate API key"), f"hctl:cwx:ek:{arg}")],
+                    [(_T("cpanel.cust.ename", "✏️ Change display name"), f"hctl:cwx:en:{arg}")],
+                    [("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")],
+                ]
+                text, kb = f"✏️ {arg}", _kb(adapter, rows)
+            elif op == "delask" and arg:
+                text, kb = screen_confirm(adapter, f"🗑 Delete custom provider {arg}? (config + stored key removed)", f"hctl:cust:delgo:{arg}", f"hctl:cust:sel:{arg}")
+            elif op == "delgo" and arg:
+                e = _custom_providers().pop(arg, None) if False else (_custom_providers().get(arg) or {})
+                if e.get("key_env"):
+                    _env_write(str(e["key_env"]), None)
+                meta = dict(_read_config().get("cpanel_providers_meta") or {})
+                meta.pop(arg, None)
+                _write_config_key(adapter, "cpanel_providers_meta", meta)
+                _custom_delete(adapter, arg)
+                warn = ""
+                if _custom_active_route() == f"custom:{arg}":
+                    warn = "\n⚠️ " + _T("cpanel.cust.activerm", "This provider was the default route — pick a new default!")
+                text, kb = screen_providers(adapter)
+                text = ("🗑 deleted " + arg + warn) + "\n\n" + text
+            else:
+                text, kb = screen_providers(adapter)
+        elif screen == "cwx":
+            pend = _pending_get(chat_id) or {"step": "", "data": {}}
+            d = dict(pend.get("data") or {})
+            pid_new = str(d.get("id") or "")
+            if op == "auth" and arg in ("bearer", "none"):
+                d["auth"] = arg
+                if arg == "bearer":
+                    _pending_set(chat_id, "cwx", "key", d)
+                    text = _cwx_steps_text("key", d)
+                    kb = _kb(adapter, [[("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]])
+                else:
+                    d["key"] = ""; d["key_masked"] = "—"
+                    base = str(d.get("base_url") or "")
+                    ids, kindd = discover_models(base, "", None)
+                    d["models"] = ids or []
+                    if ids:
+                        _pending_set(chat_id, "cwx", "modelpick", d)
+                        rows = [[(m[:50], f"hctl:cwx:model:{m[:30]}")] for m in ids[:8]]
+                        rows.append([("➖ " + _T("cpanel.add.skipmodel", "Skip / set later"), "hctl:cwx:model:-")])
+                        rows.append([("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")])
+                        text = _T("cpanel.cust.pickmodel", "Discovery OK — pick a default model:") + "\n" + _cwx_summary(d)
+                        kb = _kb(adapter, rows)
+                    else:
+                        _pending_set(chat_id, "cwx", "confirm", d)
+                        rows = [[("💾 " + _T("cpanel.save", "Save"), "hctl:cwx:save")],
+                                [("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]]
+                        text = "⚠️ " + _T("cpanel.cust.nodiscshort", "discovery failed: ") + kindd + "\n\n" + _cwx_summary(d)
+                        kb = _kb(adapter, rows)
+            elif op == "model":
+                if arg and arg != "-":
+                    d["default_model"] = arg
+                _pending_set(chat_id, "cwx", "confirm", d)
+                rows = [[("💾 " + _T("cpanel.save", "Save"), "hctl:cwx:save")],
+                        [("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]]
+                text = _cwx_summary(d)
+                kb = _kb(adapter, rows)
+            elif op == "save":
+                _pending_pop(chat_id)
+                pid = str(d.get("id") or "")
+                if _custom_id_ok(pid):
+                    fields = {"api": d["base_url"], "name": str(d.get("display") or pid)}
+                    if d.get("key"):
+                        var = _custom_env_var(pid)
+                        _env_write(var, d["key"])
+                        fields["key_env"] = var
+                    if d.get("default_model"):
+                        fields["default_model"] = d["default_model"]
+                    if d.get("models"):
+                        fields["models"] = {m: {} for m in d["models"][:20]}
+                        fields["models_discovered"] = True
+                    _custom_write(adapter, pid, fields)
+                    if d.get("website"):
+                        meta = dict(_read_config().get("cpanel_providers_meta") or {})
+                        meta[pid] = {"website": d["website"], "display": d.get("display") or pid}
+                        _write_config_key(adapter, "cpanel_providers_meta", meta)
+                    text, kb = screen_custom_detail(adapter, pid)
+                    text = "✅ " + _T("cpanel.add.saved", "Saved (no AI call made).") + "\n\n" + text
+                else:
+                    text, kb = screen_providers(adapter)
+                    text = "⚠️ " + _T("cpanel.cust.badid", "invalid id — nothing saved") + "\n\n" + text
+            elif op == "eb" and arg:
+                _pending_set(chat_id, "cwx", "basedit", {"id": arg})
+                text = _cwx_steps_text("base", {})
+                kb = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")]])
+            elif op == "ew" and arg:
+                _pending_set(chat_id, "cwx", "webedit", {"id": arg})
+                text = _cwx_steps_text("website", {})
+                kb = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")]])
+            elif op == "ek" and arg:
+                _pending_set(chat_id, "cwx", "keyedit", {"id": arg})
+                text = _cwx_steps_text("keyedit", {})
+                kb = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")]])
+            elif op == "en" and arg:
+                _pending_set(chat_id, "cwx", "nameedit", {"id": arg})
+                text = _T("cpanel.cwx.display", "Send a display name (shown in the panel).")
+                kb = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), f"hctl:cust:sel:{arg}")]])
+            else:
+                text, kb = screen_providers(adapter)
         elif screen == "status":
             text, kb = screen_status(adapter)
         elif screen == "users":
@@ -936,6 +1439,34 @@ async def consume_pending_input(adapter, update, context) -> bool:
     if not msg or not getattr(msg, "text", None):
         return False
     chat_id = str(getattr(msg, "chat_id", ""))
+    uid0 = str(getattr(getattr(update, "effective_user", None), "id", ""))
+    kind0 = _start_user_kind(adapter, uid0)
+    text0 = msg.text.strip()
+
+    # Revocation hygiene: had a persistent button but is no longer admin → remove once.
+    if kind0 != "admin" and _persist_unmark(chat_id):
+        await _persist_detach(adapter, chat_id, getattr(msg, "message_thread_id", None))
+
+    # Persistent button tap (any localized label): re-check auth AT EXECUTION TIME.
+    if text0 in _persist_labels_all():
+        if kind0 == "admin":
+            if _persist_ts(chat_id) <= 0:
+                await _persist_attach(adapter, chat_id, getattr(msg, "message_thread_id", None))
+            text, kb = screen_main(adapter)
+            try:
+                sender = getattr(adapter, "_send_control_message", None)
+                if callable(sender):
+                    await sender(chat_id, text, parse_mode=None,
+                                 thread_id=getattr(msg, "message_thread_id", None),
+                                 metadata=None, reply_markup=kb)
+                else:
+                    await msg.reply_text(text, reply_markup=kb)
+            except Exception as exc:
+                logger.warning("cpanel persist open failed: %s", scrub_text(str(exc)))
+            return True
+        # not admin: NOT consumed — the text falls through to the normal pipeline
+        return False
+
     p = _pending_get(chat_id)
     if not p:
         return False
@@ -989,6 +1520,128 @@ async def consume_pending_input(adapter, update, context) -> bool:
                                                 parse_mode=None, thread_id=getattr(msg, "message_thread_id", None), metadata=None, reply_markup=kb)
         except Exception:
             pass
+        return True
+    if flow == "cwx":
+        d = dict(p.get("data") or {})
+
+        async def _say_text(text: str, kb=None) -> None:
+            sender = getattr(adapter, "_send_control_message", None)
+            if callable(sender):
+                await sender(chat_id, text, parse_mode=None,
+                             thread_id=getattr(msg, "message_thread_id", None),
+                             metadata=None, reply_markup=kb)
+            else:
+                with suppress_exc():
+                    await msg.reply_text(text, reply_markup=kb)
+
+        cancel_kb = _kb(adapter, [[("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]])
+        raw = (text_in or "").strip()
+        if step == "id":
+            pid = raw.lower()
+            if not _custom_id_ok(pid):
+                await _say_text("⚠️ " + _T("cpanel.cust.badid", "invalid id (a-z, 0-9, dash, <=20 chars) — try again"), cancel_kb)
+                return True
+            if pid in _profiles():
+                await _say_text("⚠️ " + _T("cpanel.cust.reserved", "that id is reserved by a native provider — choose another"), cancel_kb)
+                return True
+            if pid in _custom_providers():
+                await _say_text("⚠️ " + _T("cpanel.cust.dup", "id already exists — choose another"), cancel_kb)
+                return True
+            d["id"] = pid
+            _pending_set(chat_id, "cwx", "display", d)
+            await _say_text(_cwx_steps_text("display", d), cancel_kb)
+            return True
+        if step == "display":
+            d["display"] = raw[:40] or d.get("id", "custom")
+            _pending_set(chat_id, "cwx", "website", d)
+            await _say_text(_cwx_steps_text("website", d), cancel_kb)
+            return True
+        if step in ("website", "webedit"):
+            website = "" if raw in ("-", "—") else raw
+            ok = (not website) or bool(re.match(r"^https?://[^@/\s]+", website))
+            if not ok:
+                await _say_text("⚠️ " + _T("cpanel.cust.badurl", "invalid URL — try again or '-' to skip"), cancel_kb)
+                return True
+            if step == "website":
+                d["website"] = website
+                _pending_set(chat_id, "cwx", "base", d)
+                await _say_text(_cwx_steps_text("base", d), cancel_kb)
+            else:
+                pid = str(d.get("id") or "")
+                meta = dict(_read_config().get("cpanel_providers_meta") or {})
+                cur = dict(meta.get(pid) or {})
+                cur["website"] = website
+                if not cur["website"]:
+                    cur.pop("website", None)
+                if cur:
+                    meta[pid] = cur
+                else:
+                    meta.pop(pid, None)
+                _write_config_key(adapter, "cpanel_providers_meta", meta)
+                _pending_pop(chat_id)
+                txt, kb2 = screen_custom_detail(adapter, pid)
+                await _say_text("✅\n\n" + txt, kb2)
+            return True
+        if step in ("base", "basedit"):
+            ok, why = _custom_url_ok(raw)
+            if not ok:
+                await _say_text("⚠️ URL: " + why, cancel_kb)
+                return True
+            url = raw.rstrip("/")
+            if step == "base":
+                d["base_url"] = url
+                _pending_set(chat_id, "cwx", "auth", d)
+                rows = [[("🔑 " + _T("cpanel.cust.bearer", "API key (Bearer)"), "hctl:cwx:auth:bearer")],
+                        [("🆓 " + _T("cpanel.cust.noauth", "No auth (open/local endpoint)"), "hctl:cwx:auth:none")],
+                        [("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]]
+                await _say_text(_cwx_steps_text("auth", d), _kb(adapter, rows))
+            else:
+                pid = str(d.get("id") or "")
+                _write_config_key(adapter, f"providers.{pid}.api", url)
+                _pending_pop(chat_id)
+                txt, kb2 = screen_custom_detail(adapter, pid)
+                await _say_text("✅\n\n" + txt, kb2)
+            return True
+        if step in ("key", "keyedit"):
+            key = "" if raw in ("-", "—") else raw
+            with suppress_exc():
+                if key and hasattr(msg, "delete"):
+                    await msg.delete()
+            d["key"] = key
+            d["key_masked"] = mask_secret(key) if key else "—"
+            if step == "keyedit":
+                pid = str(d.get("id") or "")
+                e = _custom_providers().get(pid) or {}
+                var = str(e.get("key_env") or "") or _custom_env_var(pid)
+                _env_write(var, key if key else None)
+                if key:
+                    _write_config_key(adapter, f"providers.{pid}.key_env", var)
+                _pending_pop(chat_id)
+                txt, kb2 = screen_custom_detail(adapter, pid)
+                await _say_text("✅\n\n" + txt, kb2)
+                return True
+            base = str(d.get("base_url") or "")
+            ids, kindd = discover_models(base, "", key or None)
+            d["models"] = ids or []
+            if ids:
+                _pending_set(chat_id, "cwx", "modelpick", d)
+                rows = [[(m[:50], f"hctl:cwx:model:{m[:30]}")] for m in ids[:8]]
+                rows.append([("➖ " + _T("cpanel.add.skipmodel", "Skip / set later"), "hctl:cwx:model:-")])
+                rows.append([("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")])
+                await _say_text(_T("cpanel.cust.pickmodel", "Discovery OK — pick a default model:") + "\n" + _cwx_summary(d), _kb(adapter, rows))
+            else:
+                _pending_set(chat_id, "cwx", "confirm", d)
+                rows = [[("💾 " + _T("cpanel.save", "Save"), "hctl:cwx:save")],
+                        [("❌ " + _T("cpanel.cancel", "Cancel"), "hctl:cust:cancel")]]
+                await _say_text("⚠️ " + _T("cpanel.cust.nodiscshort", "discovery failed: ") + kindd + "\n\n" + _cwx_summary(d), _kb(adapter, rows))
+            return True
+        if step == "nameedit":
+            pid = str(d.get("id") or "")
+            _write_config_key(adapter, f"providers.{pid}.name", raw[:40])
+            _pending_pop(chat_id)
+            txt, kb2 = screen_custom_detail(adapter, pid)
+            await _say_text("✅\n\n" + txt, kb2)
+            return True
         return True
     return True
 
