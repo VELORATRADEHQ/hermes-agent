@@ -26,11 +26,25 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setattr(_gp, "_configured_allowlist", lambda platform=None: ["1"])
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     (tmp_path / "backups").mkdir(exist_ok=True)
-    (tmp_path / "config.yaml").write_text("model:\n  default: gemini-3-flash-preview\n  provider: google\n")
+    (tmp_path / "config.yaml").write_text("model:\n  default: gemini-3-flash-preview\n  provider: gemini\n")
     (tmp_path / ".env").write_text("GEMINI_API_KEY=AQ.FAKEKEY000111222333444555\n")
     import os
     os.chmod(tmp_path / ".env", 0o600)
     return tmp_path
+
+
+@pytest.fixture()
+def real_telegram():
+    """tests/gateway/conftest.py installs a MagicMock telegram into sys.modules.
+    cpanel builds real keyboards; swap in the installed package temporarily."""
+    import importlib, sys
+    keys = [m for m in sys.modules if m == "telegram" or m.startswith("telegram.")]
+    saved = {m: sys.modules.pop(m) for m in keys}
+    real = importlib.import_module("telegram")
+    yield real
+    for m in [m for m in sys.modules if m == "telegram" or m.startswith("telegram.")]:
+        sys.modules.pop(m)
+    sys.modules.update(saved)
 
 
 @pytest.fixture()
@@ -123,7 +137,7 @@ def test_screens_do_not_import_agent_package():
 
 # ── Test A: open panel with AI unavailable (mocked down) ─────────────────────
 
-def test_A_open_panel_with_ai_down(home, noguard_net):
+def test_A_open_panel_with_ai_down(home, noguard_net, real_telegram):
     a = FakeAdapter()
     text, kb = cp.screen_main(a)
     assert "Hermes Control" in text or "کنترل" in text
@@ -132,10 +146,10 @@ def test_A_open_panel_with_ai_down(home, noguard_net):
     assert all(b.callback_data.startswith("hctl:") for row in kb.inline_keyboard for b in row)
 
 
-def test_B_provider_management_opens_offline(home, noguard_net):
+def test_B_provider_management_opens_offline(home, noguard_net, real_telegram):
     a = FakeAdapter()
     text, kb = cp.screen_providers(a)
-    assert "google" in text.lower()
+    assert "gemini" in text.lower()
     assert "AQ.FAKEKEY" not in text  # Test G precondition
     assert "AQ.F" in text and "••••" in text
     names = [b.callback_data for row in kb.inline_keyboard for b in row]
@@ -160,35 +174,35 @@ def test_C_provider_ops_without_ai(home, noguard_net):
     assert oct(os.stat(cp._env_path()).st_mode)[-3:] == "600"
     # enable/disable + default via config writes
     a = FakeAdapter()
-    assert cp._write_config_key(a, "model.disabled_providers", ["google"])
+    assert cp._write_config_key(a, "model.disabled_providers", ["gemini"])
     cfg = cp._read_config()
-    assert "google" in cp._disabled_set(cfg)
+    assert "gemini" in cp._disabled_set(cfg)
     assert cp._write_config_key(a, "model.disabled_providers", [])
     cfg = cp._read_config()
     assert not cp._disabled_set(cfg)
-    assert cp._write_config_key(a, "model.provider", "google")
+    assert cp._write_config_key(a, "model.provider", "gemini")
     assert cp._write_config_key(a, "model.default", "gemini-3-flash-preview")
 
 
-def test_C_callback_full_flow_offline(home, noguard_net):
+def test_C_callback_full_flow_offline(home, noguard_net, real_telegram):
     a = FakeAdapter()
     # open providers via callback
     q = FakeQuery("hctl:prov")
     _run(cp.handle_callback(a, q, "hctl:prov"))
-    assert q.edited and "google" in q.edited[0]["text"].lower()
+    assert q.edited and "gemini" in q.edited[0]["text"].lower()
     # toggle disable
-    q2 = FakeQuery("hctl:prov:toggle:google:off")
-    _run(cp.handle_callback(a, q2, "hctl:prov:toggle:google:off"))
+    q2 = FakeQuery("hctl:prov:toggle:gemini:off")
+    _run(cp.handle_callback(a, q2, "hctl:prov:toggle:gemini:off"))
     cfg = cp._read_config()
-    assert "google" in cp._disabled_set(cfg)
+    assert "gemini" in cp._disabled_set(cfg)
     # enable back
-    q3 = FakeQuery("hctl:prov:toggle:google:on")
-    _run(cp.handle_callback(a, q3, "hctl:prov:toggle:google:on"))
+    q3 = FakeQuery("hctl:prov:toggle:gemini:on")
+    _run(cp.handle_callback(a, q3, "hctl:prov:toggle:gemini:on"))
     assert not cp._disabled_set(cp._read_config())
     # set default
-    q4 = FakeQuery("hctl:prov:mkdefault:google")
-    _run(cp.handle_callback(a, q4, "hctl:prov:mkdefault:google"))
-    assert cp._read_config()["model"]["provider"] == "google"
+    q4 = FakeQuery("hctl:prov:mkdefault:gemini")
+    _run(cp.handle_callback(a, q4, "hctl:prov:mkdefault:gemini"))
+    assert cp._read_config()["model"]["provider"] == "gemini"
 
 
 # ── Test D: persistence across reload ────────────────────────────────────────
@@ -222,7 +236,7 @@ def test_E_quota_429_mapped(home):
     orig = httpx.Client
     httpx.Client = FakeClient
     try:
-        res = cp.run_connection_test("google")
+        res = cp.run_connection_test("gemini")
     finally:
         httpx.Client = orig
     assert res["kind"] == "quota"
@@ -248,7 +262,7 @@ def test_E2_success_maps_green(home):
     orig = httpx.Client
     httpx.Client = FakeClient
     try:
-        res = cp.run_connection_test("google")
+        res = cp.run_connection_test("gemini")
     finally:
         httpx.Client = orig
     assert res["ok"] is True and res["provider_icon"] == "🟢"
@@ -265,7 +279,7 @@ def test_E3_network_failure_mapped(home):
     orig = httpx.Client
     httpx.Client = FakeClient
     try:
-        res = cp.run_connection_test("google")
+        res = cp.run_connection_test("gemini")
     finally:
         httpx.Client = orig
     assert res["kind"] == "network"
@@ -340,7 +354,7 @@ def test_backup_restore_roundtrip(home, noguard_net):
 
 def test_pending_key_input_consumed_and_deleted(home):
     a = FakeAdapter()
-    cp._pending_set("1", "add", "keyonly", {"name": "google", "display": "google", "key_var": "GEMINI_API_KEY"})
+    cp._pending_set("1", "add", "keyonly", {"name": "gemini", "display": "gemini", "key_var": "GEMINI_API_KEY"})
     upd = SimpleNamespace(
         effective_user=SimpleNamespace(id="1"),
         message=SimpleNamespace(chat_id=1, text="sk-NEWKEY111222333444555666777",
