@@ -567,7 +567,7 @@ def _decorate(res: Dict[str, Any]) -> Dict[str, Any]:
 def _add_start(adapter):
     profs = list(_profiles().keys())
     rows = []
-    labels = {"google": "Google Gemini", "openai": "OpenAI", "anthropic": "Anthropic"}
+    labels = {"gemini": "Google Gemini", "google": "Google Gemini", "openai": "OpenAI", "anthropic": "Anthropic"}
     for name in profs:
         disp = labels.get(name, name)
         rows.append([(disp, f"hctl:add:pick:{name}")][:1] if False else [(disp, f"hctl:add:pick:{name}")])
@@ -696,7 +696,7 @@ async def handle_callback(adapter, query, data: str) -> None:
                 text, kb = _add_start(adapter)
             elif op == "pick" and arg:
                 prof = _profiles().get(arg)
-                labels = {"google": "Google Gemini", "openai": "OpenAI", "anthropic": "Anthropic"}
+                labels = {"gemini": "Google Gemini", "google": "Google Gemini", "openai": "OpenAI", "anthropic": "Anthropic"}
                 disp = labels.get(arg, getattr(prof, "display_name", "") or arg)
                 env_vars = tuple(getattr(prof, "env_vars", ()) or ())
                 if env_vars:
