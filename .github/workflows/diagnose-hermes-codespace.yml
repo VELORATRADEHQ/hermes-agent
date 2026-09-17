@@ -11,15 +11,16 @@ jobs:
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
         run: |
           set -euo pipefail
-          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
+          gh codespace ssh --codespace "$NEW_CS" -- bash -s -- "$GH_TOKEN" <<'REMOTE' 2>&1
           set -euo pipefail
-          mask(){ sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted-token]/g; s/AIza[0-9A-Za-z_-]{20,}/[redacted-gemini]/g'; }
+          TOKEN="$1"
+          mask(){ sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted-token]/g; s/AIza[0-9A-Za-z_-]{20,}/[redacted-gemini]/g; s/x-access-token:[^@"]+@/x-access-token:***@/g'; }
           R=/home/codespace/.hermes/hermes-agent
           PRE=d11aaf13ad657bef0d1e46261e3c3dd9347552ee
           NEW=79046e1209478a8a5bfeaa71f5527b34af5070c0
           TIP=$(git -C "$R" rev-parse hermes-cpanel)
           [ "$TIP" = "$PRE" ] || { echo "ABORT: pre-pull tip ($TIP) != $PRE — no changes made"; exit 2; }
-          git -C "$R" remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/VELORATRADEHQ/hermes-agent.git"
+          git -C "$R" remote set-url origin "https://x-access-token:${TOKEN}@github.com/VELORATRADEHQ/hermes-agent.git"
           git -C "$R" pull --ff-only origin hermes-cpanel | mask
           TIP2=$(git -C "$R" rev-parse hermes-cpanel)
           [ "$TIP2" = "$NEW" ] || { echo "ABORT: post-pull tip ($TIP2) != $NEW"; exit 3; }
