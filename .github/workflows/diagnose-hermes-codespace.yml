@@ -1,11 +1,11 @@
-name: cp-inspect-6
+name: git-migration-audit
 on:
   workflow_dispatch:
 jobs:
-  inspect6:
+  audit:
     runs-on: ubuntu-latest
     steps:
-      - name: Final pre-implementation code read (read-only)
+      - name: Phases 1-2-3-5 audit on NEW codespace (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
@@ -14,26 +14,79 @@ jobs:
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
           gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
           R=/home/codespace/.hermes/hermes-agent
-          A="$R/plugins/platforms/telegram/adapter.py"
-          echo "===== 1) slash_commands.py registry ====="
-          grep -nE '^(COMMANDS|_COMMANDS|SLASH|def |class |    def )' "$R/gateway/slash_commands.py" | head -30
-          echo "===== 2) callback handler body ====="
-          sed -n '4304,4420p' "$A"
-          echo "===== 3) menu commands source ====="
-          grep -nE 'def telegram_menu_commands|def telegram_menu_max_commands|menu' "$R/hermes_cli/commands_platforms.py" | head -10
-          echo "===== 4) slash access scope keys ====="
-          sed -n '21,56p' "$R/gateway/slash_access.py"
-          echo "===== 5) custom providers config key (callers) ====="
-          grep -rn 'providers_dict_to_custom_providers\|get_compatible_custom_providers' "$R" --include='*.py' --exclude-dir=venv --exclude-dir=.venv | grep -v tests | grep -v 'def ' | head -8
-          echo "===== 6) ProviderProfile fields ====="
-          sed -n '39,110p' "$R/providers/base.py"
-          echo "===== 7) auth.json top-level structure (keys only) ====="
-          python3 -c "import json;d=json.load(open('/home/codespace/.hermes/auth.json'));print(type(d).__name__); print(list(d.keys())[:12] if isinstance(d,dict) else len(d))"
-          echo "===== 8) edit_message usage in adapter ====="
-          grep -nE 'edit_message_text|edit_message_reply_markup' "$A" | head -8
-          echo "===== 9) pairing store methods ====="
-          grep -nE '    def (list_|get_|approve|decline|reject|revoke|remove|is_)' "$R/gateway/pairing.py" | head -15
-          echo "===== 10) PTB version ====="
-          "$R/venv/bin/python" -c "import telegram; print('python-telegram-bot', telegram.__version__)"
+          cd "$R"
+          echo "===== 1) git identity ====="
+          echo "cwd: $(pwd)"
+          echo "branch: $(git -c safe.directory='*' rev-parse --abbrev-ref HEAD)"
+          echo "HEAD: $(git -c safe.directory='*' rev-parse HEAD)"
+          git -c safe.directory='*' log -1 --format='subject: %s%nauthor_date: %aI'
+          echo "--- remotes:"
+          git -c safe.directory='*' remote -v
+          echo "--- status (porcelain, path+code only):"
+          git -c safe.directory='*' status --porcelain=v1 | head -30
+          echo "porcelain line count: $(git -c safe.directory='*' status --porcelain=v1 | wc -l)"
+          echo "===== 2) working-tree cleanliness ====="
+          echo "tracked-modified files: $(git -c safe.directory='*' diff --name-only | wc -l)"
+          echo "staged files: $(git -c safe.directory='*' diff --cached --name-only | wc -l)"
+          echo "untracked files:"; git -c safe.directory='*' ls-files --others --exclude-standard | head -20
+          echo "ignored items present (count): $(git -c safe.directory='*' status --ignored --porcelain | grep -c '^!!' || true)"
+          echo "===== 3) version ====="
+          grep -m1 '^version' pyproject.toml
+          ls hermes_bootstrap.py >/dev/null 2>&1 && grep -m1 -rE 'VERSION|__version__' hermes_constants.py 2>/dev/null | head -2
+          venv/bin/python -c "import importlib.metadata as m;print('installed dist version:', m.version('hermes-agent'))" 2>/dev/null || echo "dist metadata: n/a"
+          echo "===== 4) .gitignore ====="
+          if [ -f .gitignore ]; then echo "present ($(wc -l < .gitignore) lines)"; cat .gitignore; else echo "MISSING"; fi
+          echo "===== 5) secret scan over TRACKED files only ====="
+          venv/bin/python - <<'PYEOF'
+          import re, subprocess, collections
+          pats = {
+            'telegram_bot_token': r'\b\d{6,}:[A-Za-z0-9_-]{30,}',
+            'openai_style_sk':  r'\bsk-[A-Za-z0-9_-]{20,}',
+            'gemini_aq':        r'\bAQ\.[A-Za-z0-9_-]{8,}',
+            'google_aiza':      r'\bAIza[0-9A-Za-z_-]{20,}',
+            'github_pat':       r'\bgh[pousr]_[A-Za-z0-9]{20,}',
+            'aws_akia':         r'\bAKIA[0-9A-Z]{16}',
+            'slack_xox':        r'\bxox[bpoas]-[A-Za-z0-9-]{10,}',
+            'private_key_pem':  r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----',
+            'auth_json_name':   None,
+            'dotenv_name':      None,
+          }
+          files = subprocess.run(['git','-c','safe.directory=*','ls-files'], capture_output=True, text=True).stdout.splitlines()
+          hits = collections.defaultdict(list)
+          authjson=[]; dotenv=[]
+          for f in files:
+            lf=f.lower()
+            if lf.endswith('auth.json'): authjson.append(f)
+            if re.search(r'(^|/)\.env(\.|$)', lf) or lf=='.env': dotenv.append(f)
+            if any(x in f for x in ('venv/','.venv/','backups/')): continue
+            try: data=open(f,'rb').read(400000).decode('utf-8','ignore')
+            except Exception: continue
+            for name,rx in pats.items():
+              if rx and re.search(rx,data): hits[name].append(f)
+          print('tracked files scanned:', len(files))
+          for name,fl in sorted(hits.items()):
+            for f in sorted(set(fl))[:10]: print(f'FOUND {name} :: {f}')
+          print(f'tracked auth.json files: {authjson or "none"}')
+          print(f'tracked .env files: {dotenv or "none"}')
+          if not hits and not authjson and not dotenv: print('SCAN RESULT: SAFE (no secret patterns in tracked tree)')
+          PYEOF
+          echo "===== 6) tracked runtime/generated contamination ====="
+          echo "venv tracked files: $(git -c safe.directory='*' ls-files venv | wc -l)"
+          echo ".venv tracked files: $(git -c safe.directory='*' ls-files .venv | wc -l)"
+          echo "egg-info tracked files: $(git -c safe.directory='*' ls-files hermes_agent.egg-info | wc -l)"
+          echo "pycache tracked files: $(git -c safe.directory='*' ls-files | grep -c '__pycache__' || true)"
+          echo "db/state tracked files: $(git -c safe.directory='*' ls-files | grep -cE '\.(db|sqlite|pid|lock)$' || true)"
+          echo "log tracked files: $(git -c safe.directory='*' ls-files | grep -cE '\.log$' || true)"
+          echo "===== 7) cpanel items must NOT exist yet ====="
+          for p in gateway/cpanel.py locales/fa.yaml tests/gateway/test_cpanel.py; do
+            [ -e "$p" ] && echo "$p EXISTS (unexpected!)" || echo "$p absent (correct)"
+          done
+          grep -c 'hctl' plugins/platforms/telegram/adapter.py || echo "hctl refs: 0 (correct)"
+          echo "===== 8) size / push estimate ====="
+          git -c safe.directory='*' count-objects -vH | grep -E 'size-pack|count|in-pack'
+          git -c safe.directory='*' ls-files | wc -l
+          echo "===== 9) checkpoint ====="
+          echo "CHECKPOINT branch=$(git -c safe.directory='*' rev-parse --abbrev-ref HEAD) head=$(git -c safe.directory='*' rev-parse HEAD) status_lines=$(git -c safe.directory='*' status --porcelain=v1 | wc -l)"
+          grep -m1 '^version' pyproject.toml | sed 's/^/CHECKPOINT /'
           REMOTE
-          echo "===== INSPECT6=DONE ====="
+          echo "===== GMAUDIT=DONE ====="
