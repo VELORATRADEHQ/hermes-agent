@@ -48,17 +48,21 @@ jobs:
           PY
           python3 - <<'PY'
           import yaml, glob
-          keys=[k for k in yaml.safe_load(open("locales/en.yaml")) if k.startswith(("help.","cpanel."))]
-          keyset=set(yaml.safe_load(open("locales/en.yaml")))
+          def fl(node, prefix, out):
+              if isinstance(node, dict):
+                  for k,v in node.items():
+                      fl(v, (prefix+"."+str(k)) if prefix else str(k), out)
+              elif isinstance(node, str):
+                  out[prefix]=node
+          en_flat={}
+          fl(yaml.safe_load(open("locales/en.yaml")) or {}, "", en_flat)
+          keyset=set(en_flat)
           for f in sorted(glob.glob("locales/*.yaml")):
               d=yaml.safe_load(open(f)) or {}
               flat={}
-              def fl(node,prefix):
-                  if isinstance(node,dict):
-                      for k,v in node.items(): fl(v,(prefix+"."+str(k)) if prefix else str(k))
-                  else: flat[prefix]=node
-              fl(d,"")
-              assert set(flat)==keyset, f"{f}: catalog parity broken ({len(set(flat)^keyset)} keys differ)"
+              fl(d, "", flat)
+              missing=keyset-set(flat); extra=set(flat)-keyset
+              assert not missing and not extra, f"{f}: catalog parity broken (missing={sorted(missing)[:3]} extra={sorted(extra)[:3]})"
           assert yaml.safe_load(open("locales/fa.yaml"))["help"]["title"].startswith("📖")
           print("PARITY_CHECK_OK", len(glob.glob('locales/*.yaml')), "locales,", len(keyset), "keys")
           PY
