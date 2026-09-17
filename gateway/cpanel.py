@@ -644,6 +644,77 @@ async def handle_command(adapter, update, context) -> None:
     except Exception as exc:
         logger.warning("cpanel panel send failed: %s", scrub_text(str(exc)))
 
+# ── /start menu (authorized users only; unknowns are deferred to the native path) ──
+
+def _start_user_kind(adapter, user_id: str) -> str:
+    """admin | user | unknown — resolved ONLY via native pairing/allowlist helpers.
+
+    admin  = configured allowlist member, or (no allowlist) pairing-approved
+    user   = authorized by the native union (allowlist member or pairing-approved) but not admin
+    unknown = anything else (incl. helper failures) → caller defers to native /start handling
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return "unknown"
+    try:
+        from gateway.pairing import _configured_allowlist, PairingStore  # native
+        al = _configured_allowlist("telegram")
+        ids: Any = []
+        if al:
+            ids = al[1] if isinstance(al, tuple) and len(al) == 2 else al
+            if isinstance(ids, str):
+                ids = [x.strip() for x in ids.split(",") if x.strip()]
+        in_allow = bool(ids) and uid in {str(x) for x in ids}
+        try:
+            approved = bool(PairingStore().is_approved("telegram", uid))
+        except Exception:
+            approved = False
+    except Exception:
+        return "unknown"  # fail-closed: never guess
+    if in_allow or (not al and approved):
+        return "admin"
+    if in_allow or approved:
+        return "user"
+    return "unknown"
+
+
+async def handle_start_command(adapter, update, context) -> None:
+    """`/start` — welcome + inline menu. Admin sees the Control Panel button (hctl:main);
+
+    mere authorized users get the menu without admin controls; unknown users are handed
+    back to the native command pipeline unchanged (silent ack / pairing)."""
+    msg = getattr(update, "message", None)
+    if not msg or not getattr(msg, "text", None):
+        return
+    uid = str(getattr(getattr(update, "effective_user", None), "id", ""))
+    kind = _start_user_kind(adapter, uid)
+    if kind == "unknown":
+        native = getattr(adapter, "_handle_command", None)
+        if callable(native):
+            try:
+                await native(update, context)  # native /start: ack ignore + pairing flow
+            except Exception as exc:
+                logger.warning("cpanel start: native handoff failed: %s", scrub_text(str(exc)))
+        return
+    name = (getattr(getattr(update, "effective_user", None), "first_name", "") or "").strip()
+    welcome = _T("cpanel.start.welcome", "🛡️ Hermes is running. Choose an option:")
+    if name:
+        welcome = f"{name} — {welcome}"
+    kb = None
+    if kind == "admin":
+        kb = _kb(adapter, [[(_T("cpanel.start.panel_button", "🎛 Control Panel"), "hctl:main")]])
+    chat_id = str(getattr(msg, "chat_id", "") or uid)
+    thread_id = getattr(msg, "message_thread_id", None)
+    try:
+        sender = getattr(adapter, "_send_control_message", None)
+        if callable(sender):
+            await sender(chat_id, welcome, parse_mode=None, thread_id=thread_id, metadata=None, reply_markup=kb)
+        else:
+            await msg.reply_text(welcome, reply_markup=kb)
+    except Exception as exc:
+        logger.warning("cpanel start menu send failed: %s", scrub_text(str(exc)))
+
+
 async def handle_callback(adapter, query, data: str) -> None:
     cb = adapter._callback_ctx(query)
     if not await adapter._callback_authorized(query, cb, _UNAUTHORIZED):
