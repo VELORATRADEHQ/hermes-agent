@@ -1,11 +1,11 @@
-name: cp-inspect-3
+name: cp-inspect-4
 on:
   workflow_dispatch:
 jobs:
-  inspect3:
+  inspect4:
     runs-on: ubuntu-latest
     steps:
-      - name: Architecture inspection round 3 (read-only)
+      - name: Architecture inspection round 4 (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
@@ -14,38 +14,27 @@ jobs:
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
           gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
           R=/home/codespace/.hermes/hermes-agent
-          echo "===== A) provider CLI / files ====="
-          find "$R/hermes_cli" -name '*.py' | sed "s|$R/||" | grep -E 'provider|model' || echo "no provider/model CLI files"
-          grep -rnE "add_parser\('(provider|model|pairing)'" "$R/hermes_cli/" 2>/dev/null | head -8
-          echo "===== B) providers/ package ====="
-          grep -nE '^(class |def |PROVIDERS|REGISTRY)' "$R/providers/base.py" "$R/providers/__init__.py" 2>/dev/null | head -25
-          echo "===== C) provider_registry / profiles ====="
-          grep -nE '^(class |def )' "$R/agent/provider_registry.py" | head -20
-          grep -rn 'profile' "$R/agent/provider_registry.py" | head -8
-          echo "===== D) provider profiles test (structure hint) ====="
-          grep -nE '(class |def test|profiles|provider:|base_url|api_key|models:)' "$R/tests/providers/test_provider_profiles.py" | head -25
-          echo "===== E) config model: subtree (sanitized) ====="
-          python3 - <<'PYEOF'
-          import re
-          t=open('/home/codespace/.hermes/config.yaml').read().splitlines()
-          grab=False
-          for l in t:
-            if l.startswith('model:'): grab=True
-            elif grab and re.match(r'^[a-zA-Z_]', l): break
-            if grab: print(re.sub(r'(key|token|secret)(:\s*)\S+', r'\1\2[masked]', l))
-          PYEOF
-          echo "===== F) adapter callback/command wiring ====="
-          grep -nE 'CallbackQuery|callback_query|InlineKeyboardButton|InlineKeyboardMarkup' "$R/plugins/platforms/telegram/adapter.py" | head -12
-          echo "--- bot commands registration:"
-          grep -nE 'BotCommand|setMyCommands|set_my_commands' "$R/plugins/platforms/telegram/adapter.py" | head -6
-          echo "--- approval buttons origin:"
-          grep -nE 'approval|_send_buttons|reply_markup' "$R/plugins/platforms/telegram/adapter.py" | head -10
-          echo "===== G) pairing module API ====="
-          grep -nE '^(class |def |    def )' "$R/gateway/pairing.py" | head -30
-          echo "===== H) locales structure ====="
-          ls "$R/locales/" 2>/dev/null | head -20
-          find "$R/locales" -maxdepth 3 -type f | head -6
-          echo "===== I) pairing CLI wiring ====="
-          grep -rn "pairing approve\|'approve'" "$R/hermes_cli/"*.py 2>/dev/null | grep -i pair | head -5
+          echo "===== A) gateway core files ====="
+          ls "$R/gateway/" | grep -vE '\.pyc|__pycache__' | grep -E 'slash|command|admin|control|panel' || echo "no slash/admin files"
+          ls "$R/gateway/" | grep -v __pycache__ | head -30
+          echo "===== B) config_providers def index ====="
+          grep -nE '^(class |def |    def )' "$R/hermes_cli/config_providers.py" | head -30
+          echo "===== C) where provider config is WRITTEN ====="
+          grep -nE 'safe_dump|write_text|set_key|dotenv|\.env' "$R/hermes_cli/config_providers.py" | head -12
+          echo "===== D) callback-query handler + data prefixes ====="
+          grep -n 'async def _handle_callback_query' "$R/plugins/platforms/telegram/adapter.py"
+          grep -nE 'data\.(startswith|split)|callback_data=' "$R/plugins/platforms/telegram/adapter.py" | head -18
+          echo "===== E) menu_commands construction ====="
+          grep -n 'menu_commands' "$R/plugins/platforms/telegram/adapter.py" | head -6
+          echo "===== F) slash command registry ====="
+          grep -nE '^(class |def |    def )' "$R/gateway/slash_commands_model.py" | head -12
+          grep -rln 'register_slash\|SLASH_COMMANDS\|slash_dispatch' "$R/gateway/" --include='*.py' | grep -v __pycache__ | head -6
+          echo "===== G) provider catalog (supported providers) ====="
+          grep -nE '^\s*["\x27](google|openai|anthropic|openrouter|groq|mistral|xai|nvidia|kimi|nous|deepseek|ollama|azure|bedrock|custom)' "$R/hermes_cli/provider_catalog.py" | head -25
+          wc -l "$R/hermes_cli/provider_catalog.py"
+          echo "===== H) approval flow (buttons precedent) ====="
+          grep -nE '^(class |def |    def |EA_)' "$R/gateway/platforms/base_exec_approval.py" | head -15
+          echo "===== I) remote ====="
+          git -c safe.directory='*' -C "$R" remote -v | sed 's|https://[^@]*@|https://[redacted]@|' | head -3
           REMOTE
-          echo "===== INSPECT3=DONE ====="
+          echo "===== INSPECT4=DONE ====="
