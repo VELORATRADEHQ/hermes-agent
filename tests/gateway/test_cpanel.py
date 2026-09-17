@@ -364,3 +364,127 @@ def test_pending_key_input_consumed_and_deleted(home):
     assert consumed is True
     assert upd.message.delete.await_count == 1
     assert cp._env_get("GEMINI_API_KEY") == "sk-NEWKEY111222333444555666777"
+# ── New spec (A–J): admin CAN open the panel (positive B) ────────────────────
+
+def test_B_admin_can_open_panel_via_command(home, noguard_net, real_telegram):
+    a = FakeAdapter()
+    upd = SimpleNamespace(
+        effective_user=SimpleNamespace(id="1"),
+        message=SimpleNamespace(chat_id=1, message_thread_id=None,
+                                text="/panel", reply_text=AsyncMock()))
+    _run(cp.handle_command(a, upd, None))
+    assert a.sent, "admin received no panel"
+    first = a.sent[0]["text"]
+    assert "Hermes Control" in first or "کنترل" in first
+    assert all("AQ.FAKEKEY" not in m["text"] for m in a.sent)
+
+
+def test_B2_non_admin_cannot_open_panel_via_command(home, noguard_net):
+    a = FakeAdapter()
+    upd = SimpleNamespace(
+        effective_user=SimpleNamespace(id="999"),
+        message=SimpleNamespace(chat_id=1, message_thread_id=None,
+                                text="/panel", reply_text=AsyncMock()))
+    _run(cp.handle_command(a, upd, None))
+    assert not a.sent
+    assert upd.message.reply_text.await_count >= 1  # polite unauthorized reply
+
+
+# ── New spec C: EVERY sensitive callback re-checks authorization ─────────────
+
+SENSITIVE_CALLBACKS = [
+    "hctl:prov", "hctl:prov:sel:gemini", "hctl:prov:toggle:gemini:off",
+    "hctl:prov:mkdefault:gemini", "hctl:prov:delask:gemini", "hctl:prov:del:gemini",
+    "hctl:add:start", "hctl:add:pick:gemini", "hctl:add:keyonly:gemini",
+    "hctl:models", "hctl:models:set:gemini-3-flash-preview", "hctl:models:type",
+    "hctl:test", "hctl:test:sel:gemini", "hctl:test:go:gemini",
+    "hctl:status", "hctl:users", "hctl:users:ok:12345", "hctl:users:rv:1", "hctl:users:rvgo:1",
+    "hctl:settings", "hctl:settings:lang:fa", "hctl:settings:comp:on",
+    "hctl:logs", "hctl:backup", "hctl:backup:go", "hctl:backup:ask:x", "hctl:backup:do:x",
+]
+
+
+@pytest.mark.parametrize("data", SENSITIVE_CALLBACKS)
+def test_C_every_sensitive_callback_fails_closed(home, noguard_net, data):
+    a = FakeAdapter(authorized=False)  # pairing/callback auth says NO
+    q = FakeQuery(data)
+    _run(cp.handle_callback(a, q, data))
+    assert not q.edited, f"unauthorized user reached UI via {data}"
+    assert q.answer.await_count >= 1
+
+
+@pytest.mark.parametrize("data", SENSITIVE_CALLBACKS)
+def test_C2_admin_gate_recalled_after_pairing_pass(home, noguard_net, data):
+    """Passing callback-auth is not enough: admin gate must also deny."""
+    a = FakeAdapter(authorized=True)
+    import gateway.cpanel as m
+    orig = m._is_admin
+    m._is_admin = lambda adapter, uid: False
+    try:
+        q = FakeQuery(data, uid="999")
+        _run(cp.handle_callback(a, q, data))
+        assert not q.edited, f"non-admin reached UI via {data}"
+    finally:
+        m._is_admin = orig
+
+
+# ── New spec J: Persian catalog parity (no parallel localization system) ─────
+
+def _flatten(d, prefix=""):
+    out = set()
+    for k, v in (d or {}).items():
+        key = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            out |= _flatten(v, key)
+        else:
+            out.add(key)
+    return out
+
+
+def test_J_fa_catalog_parity_with_en():
+    import yaml
+    loc = Path(cp.__file__).parent.parent / "locales"
+    en = yaml.safe_load((loc / "en.yaml").read_text()) or {}
+    fa = yaml.safe_load((loc / "fa.yaml").read_text()) or {}
+    en_keys = _flatten(en.get("cpanel", {}))
+    fa_keys = _flatten(fa.get("cpanel", {}))
+    assert en_keys, "en catalog missing cpanel block"
+    missing = en_keys - fa_keys
+    extra = fa_keys - en_keys
+    assert not missing, f"fa missing keys: {sorted(missing)}"
+    assert not extra, f"fa has unknown keys: {sorted(extra)}"
+
+
+def test_J2_fa_strings_are_persian_and_nonempty():
+    import yaml, re as _re
+    loc = Path(cp.__file__).parent.parent / "locales"
+    fa = yaml.safe_load((loc / "fa.yaml").read_text()) or {}
+
+    def walk(d):
+        for v in (d or {}).values():
+            if isinstance(v, dict):
+                yield from walk(v)
+            else:
+                yield str(v)
+
+    vals = list(walk(fa.get("cpanel", {})))
+    assert vals and all(v.strip() for v in vals)
+    persian = sum(1 for v in vals if _re.search(r"[\u0600-\u06FF]", v))
+    assert persian >= len(vals) * 0.6, f"only {persian}/{len(vals)} fa strings contain Persian text"
+
+
+# ── New spec I: native adapter behavior untouched apart from additions ───────
+
+def test_I_native_adapter_dispatch_intact():
+    import inspect
+    ad = pytest.importorskip("plugins.platforms.telegram.adapter",
+                             reason="full adapter deps unavailable in this environment")
+    src = inspect.getsource(ad.TelegramAdapter._handle_callback_query)
+    # native anchors still present
+    assert "prefix, body = " in src or "prefix, body" in src, "native callback prefix split missing"
+    assert "mp" in src and "ea" in src, "native model-picker/approval anchors disturbed"
+    # cpanel taps ONLY the hctl: branch, placed before native dispatch
+    assert 'data.startswith("hctl:")' in src
+    assert src.index('data.startswith("hctl:")') < src.index("prefix, body"), "hctl branch must run before native prefixes"
+    # panel command handler registered alongside native ones
+    assert hasattr(ad.TelegramAdapter, "_handle_cpanel_command")
