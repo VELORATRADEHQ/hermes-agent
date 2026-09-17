@@ -18,6 +18,25 @@ from tests.gateway.test_cpanel_t5 import (LoAdapter, TQuery, _cb, _c, tmsg, cfg,
 
 
 @pytest.fixture(autouse=True)
+def _defaults(monkeypatch):
+    """Same harness baseline as tests/gateway/test_cpanel_t5.py (autouse fixtures do NOT
+    cross module boundaries — the callbacks below are allowlisted admin interactions)."""
+    monkeypatch.setattr(cp, "_start_user_kind", lambda a, u: "admin")
+    monkeypatch.setattr(cp, "_is_admin", lambda a, u: True)
+
+    class _FakeProf:
+        def __init__(self, name): self.name = name
+        base_url = "https://api.openai.com/v1"
+        env_vars = ("OPENAI_API_KEY",)
+        models_url = ""
+        auth_type = "api_key"
+        supports_health_check = False
+        supports_model_listing = True
+        def __hash__(self): return hash(self.name)
+    monkeypatch.setattr(cp, "_profiles", lambda: {"openai": _FakeProf("openai")})
+
+
+@pytest.fixture(autouse=True)
 def _clean_filter_state():
     """_PROV_LIST_FILTER is keyed by adapter id(); CPython id reuse must not leak filter state between tests."""
     cp._PROV_LIST_FILTER.clear()
@@ -37,6 +56,12 @@ def real_telegram():
     for m in [m for m in sys.modules if m == "telegram" or m.startswith("telegram.")]:
         sys.modules.pop(m)
     sys.modules.update(saved)
+
+
+def _loc(key: str, default: str) -> str:
+    """Expected localized text in the CURRENT display language (fa on this deployment):
+    computed through the same _T the app renders with — tests stay language-independent."""
+    return cp._T(key, default)
 
 
 PROBE_OK = {"ok": True, "verdict": "SUCCESS", "category": "success", "http_status": 200,
@@ -91,7 +116,7 @@ def test_base_edit_failed_probe_keeps_old_url(env, monkeypatch):
     run(_cb(a, "hctl:cwx:eb:acme"))
     run(_c(a, tmsg("https://new.example/v2")))
     assert cfg(env)["providers"]["acme"]["api"] == "https://old.example/v1"
-    assert a.sent and ("kept unchanged" in (a.sent[-1]["text"] or ""))
+    assert a.sent and (_loc("cpanel.cwx.editblocked", "kept unchanged")[:12].strip() in (a.sent[-1]["text"] or ""))
 
 
 def test_key_rotation_failed_probe_keeps_old_secret(env, monkeypatch):
@@ -134,20 +159,22 @@ def test_task_only_detail_hides_set_default_and_models(env, monkeypatch, real_te
         "provider_capabilities": ["browser_tasks", "async_runs"],
         "discovery": {"type": "none"}, "runtime": {"protocol": "task_run"}})
     text, kb = cp.screen_custom_detail(a, "acme")
-    labels = [b.text for row in kb.inline_keyboard for b in row]
-    assert not any("Set Default" in l or "Models" in l for l in labels)
-    assert "task-only" in text
-    assert "Model discovery: Not applicable" in text
+    codes = [str(b.callback_data or "") for row in kb.inline_keyboard for b in row]
+    assert not any(c.startswith("hctl:cust:setdef:") for c in codes)
+    assert not any(c.startswith("hctl:cust:models:") for c in codes)
+    assert any(c.startswith("hctl:cust:go:") for c in codes)  # Test stays for task providers
+    assert _loc("cpanel.cust.taskbadge", "task-only") in text
+    assert _loc("cpanel.cust.discnone", "Model discovery: Not applicable") in text
     assert "browser_tasks" in text
 
 
 def test_legacy_detail_keeps_setdefault_and_models(env, monkeypatch, real_telegram):
     a = _seed_removed(env, monkeypatch, {})
     text, kb = cp.screen_custom_detail(a, "acme")
-    labels = [b.text for row in kb.inline_keyboard for b in row]
-    assert any("Set Default" in l for l in labels)
-    assert any("Models" in l for l in labels)
-    assert "(legacy default)" in text
+    codes = [str(b.callback_data or "") for row in kb.inline_keyboard for b in row]
+    assert any(c.startswith("hctl:cust:setdef:") for c in codes)
+    assert any(c.startswith("hctl:cust:models:") for c in codes)
+    assert _loc("cpanel.cust.capslegacy", "(legacy default)") in text
 
 
 def test_setdef_directly_rejected_for_task_only(env, monkeypatch):
@@ -156,7 +183,7 @@ def test_setdef_directly_rejected_for_task_only(env, monkeypatch):
         "default_model": "does-not-matter"})
     q = run(_cb(a, "hctl:cust:setdef:acme"))
     body = (q.edited[-1][0] or "") if q.edited else ""
-    assert "task-only" in body
+    assert "🚫" in body and _loc("cpanel.cust.nosetdef", "task-only")[:8] in body
     assert cfg(env).get("model", {}).get("provider") != "custom:acme"
 
 
@@ -166,7 +193,7 @@ def test_models_direct_shows_not_applicable(env, monkeypatch):
         "provider_capabilities": ["browser_tasks"], "discovery": {"type": "none"}})
     q = run(_cb(a, "hctl:cust:models:acme"))
     body = (q.edited[-1][0] or "") if q.edited else ""
-    assert "Not applicable" in body
+    assert _loc("cpanel.cust.discnone", "Model discovery: Not applicable") in body
 
 
 def test_test_button_uses_generic_probe_and_shows_verdict(env, monkeypatch):
@@ -174,7 +201,7 @@ def test_test_button_uses_generic_probe_and_shows_verdict(env, monkeypatch):
     a = _seed_removed(env, monkeypatch, {})
     q = run(_cb(a, "hctl:cust:go:acme"))
     body = (q.edited[-1][0] or "") if q.edited else ""
-    assert "HTTP 401" in body and "authentication failed" in body
+    assert "HTTP 401" in body and _loc("cpanel.test.auth", "Reason: authentication failed — check the stored key.") in body
 
 
 def test_compact_list_tags_task_only_and_filters(env, monkeypatch, real_telegram):
@@ -182,9 +209,10 @@ def test_compact_list_tags_task_only_and_filters(env, monkeypatch, real_telegram
     a._save_gateway_config_key("providers.tasker.api", "https://api.tasker.example/")
     a._save_gateway_config_key("providers.tasker.provider_capabilities", ["browser_tasks", "async_runs"])
     a._save_gateway_config_key("providers.chatty.api", "https://api.chatty.example/v1")
+    a._save_gateway_config_key("providers.chatty.key_env", "CUSTOM_CHATTY_API_KEY")
     cp._env_write("CUSTOM_CHATTY_API_KEY", "k")
     text, kb = cp.screen_providers(a)
-    assert "tasker" in text and "task-only" in text
+    assert "tasker" in text and _loc("cpanel.cust.tasktag", "· task-only") in text
     # filter chips present
     codes = [b.callback_data for row in kb.inline_keyboard for b in row]
     assert any(str(c).startswith("hctl:cust:listf:") for c in codes)
