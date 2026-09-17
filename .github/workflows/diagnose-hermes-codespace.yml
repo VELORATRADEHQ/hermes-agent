@@ -1,11 +1,11 @@
-name: cpanel-deploy2
+name: cpanel-deploy3
 on:
   workflow_dispatch:
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Install pytest, run cpanel tests
+      - name: Reset to branch tip, re-patch, run tests with full output
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
@@ -17,19 +17,35 @@ jobs:
           R=/home/codespace/.hermes/hermes-agent
           cd "$R"
           g(){ git -c safe.directory='*' "$@"; }
-          echo "===== 0) confirm branch + prior patch applied ====="
-          g rev-parse --abbrev-ref HEAD
-          grep -c 'hctl:' plugins/platforms/telegram/adapter.py | sed 's/^/hctl refs: /'
-          echo "===== 1) ensure pip (ensurepip) then install pytest into venv ====="
-          if ! venv/bin/python -m pytest --version >/dev/null 2>&1; then
-            if command -v uv >/dev/null 2>&1; then uv pip install -q --python "$R/venv/bin/python" pytest pytest-asyncio; echo "via uv(PATH)";
-            elif [ -x "$HOME/.local/bin/uv" ]; then "$HOME/.local/bin/uv" pip install -q --python "$R/venv/bin/python" pytest pytest-asyncio; echo "via uv(local)";
-            elif [ -x "$HOME/.cargo/bin/uv" ]; then "$HOME/.cargo/bin/uv" pip install -q --python "$R/venv/bin/python" pytest pytest-asyncio; echo "via uv(cargo)";
-            else curl -sSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && venv/bin/python /tmp/get-pip.py -q && venv/bin/python -m pip install -q pytest pytest-asyncio; echo "via get-pip"; fi
-          fi
-          venv/bin/python -m pytest --version
-          echo "===== 2) pytest cpanel ====="
-          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q 2>&1 | tail -30
+          echo "===== 0) reset to new branch tip (stall patched files) ====="
+          g stash push -q -m cpanel-patched 2>&1 | tail -1 || true
+          g fetch origin hermes-cpanel 2>&1 | tail -1
+          g checkout -B hermes-cpanel origin/hermes-cpanel 2>&1 | tail -1
+          g rev-parse --short HEAD
+          echo "===== 1) re-apply patch (idempotent) ====="
+          venv/bin/python /tmp/cp_patch.py
+          echo "===== 2) real-module integration diagnostics ====="
+          venv/bin/python - <<'PYX'
+          import inspect
+          import hermes_cli.config as hc
+          print("read_user_config_raw sig:", inspect.signature(hc.read_user_config_raw))
+          from providers import list_providers
+          profs = {p.name: p for p in list_providers() if getattr(p, "name", "")}
+          g = profs.get("google")
+          if g:
+              print("google profile attrs:", sorted(k for k in vars(g).keys())[:30])
+              print("google env_vars:", getattr(g, "env_vars", None), "| base_url:", getattr(g, "base_url", None))
+          else:
+              print("providers names:", sorted(profs.keys()))
+          import gateway.pairing as gp
+          print("pairing has _configured_allowlist:", hasattr(gp, "_configured_allowlist"))
+          from agent.i18n import t, reset_language_cache
+          reset_language_cache()
+          print("t(cpanel.main.title):", repr(t("cpanel.main.title")))
+          print("t(cpanel.back):", repr(t("cpanel.back")))
+          PYX
+          echo "===== 3) pytest cpanel (full output) ====="
+          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q --tb=short 2>&1 | tail -120
           REMOTE
       - name: Commit patches, push, restart gateway, verify
         env:
@@ -44,11 +60,11 @@ jobs:
           R=/home/codespace/.hermes/hermes-agent
           cd "$R"
           g(){ git -c safe.directory='*' "$@"; }
-          echo "===== 6) test gate re-check + commit ====="
-          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q > /tmp/pt.out 2>&1 && echo "PYTEST_OK $(tail -1 /tmp/pt.out)" || { echo "STOP PYTEST_FAILED"; tail -30 /tmp/pt.out; exit 3; }
+          echo "===== 4) test gate re-check + commit ====="
+          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q > /tmp/pt.out 2>&1 && echo "PYTEST_OK $(tail -1 /tmp/pt.out)" || { echo "STOP PYTEST_FAILED"; tail -40 /tmp/pt.out; exit 3; }
           g add plugins/platforms/telegram/adapter.py agent/i18n.py locales/
           g -c user.name="velora-ops" -c user.email="ops@veloratrade.local" commit -m "cpanel: adapter hctl wiring + /panel command + fa i18n + locale stubs" 2>&1 | tail -2
-          echo "===== 7) push branch ====="
+          echo "===== 5) push branch ====="
           if ! g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" push origin hermes-cpanel 2>&1 | mask; then
             echo "STOP PUSH_REJECTED"; exit 10
           fi
@@ -58,7 +74,7 @@ jobs:
           echo "local: $LSHA"; echo "remote: $RSHA"
           [ "$RSHA" = "$LSHA" ] || { echo "STOP LSREMOTE_MISMATCH"; exit 11; }
           echo "PUSH_VERIFIED"
-          echo "===== 8) gateway restart (process only, persistent log) ====="
+          echo "===== 6) gateway restart (process only, persistent log) ====="
           OLD=$(pgrep -f 'hermes gateway' | head -1 || true)
           [ -n "$OLD" ] && kill -TERM "$OLD" 2>/dev/null || true
           for i in $(seq 1 20); do sleep 2; pgrep -f 'hermes gateway' >/dev/null || break; done
@@ -75,7 +91,7 @@ jobs:
           done
           [ "$ok" = "1" ] || { echo "STOP GATEWAY_NO_HEARTBEAT"; tail -20 /home/codespace/.hermes/state/hermes-gateway.log | sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted]/g'; exit 12; }
           pgrep -fc 'hermes gateway' | sed 's/^/gateway processes: /'
-          echo "===== 9) panel smoke: render every screen offline ====="
+          echo "===== 7) panel smoke: render every screen offline ====="
           cd "$R"
           venv/bin/python - <<'PYD'
           import gateway.cpanel as cp
