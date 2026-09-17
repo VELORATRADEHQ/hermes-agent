@@ -480,11 +480,15 @@ def test_I_native_adapter_dispatch_intact():
     ad = pytest.importorskip("plugins.platforms.telegram.adapter",
                              reason="full adapter deps unavailable in this environment")
     src = inspect.getsource(ad.TelegramAdapter._handle_callback_query)
-    # native anchors still present
-    assert "prefix, body = " in src or "prefix, body" in src, "native callback prefix split missing"
-    assert "mp" in src and "ea" in src, "native model-picker/approval anchors disturbed"
-    # cpanel taps ONLY the hctl: branch, placed before native dispatch
+    # native dispatch targets still present and unordered-disturbed
+    assert "self._handle_model_picker_callback" in src, "native model picker dispatch disturbed"
+    assert "self._handle_choice_picker_callback" in src, "native choice picker dispatch disturbed"
+    assert "self._handle_exec_approval_callback" in src, "native exec-approval dispatch disturbed"
+    # cpanel taps ONLY the hctl: branch, placed before ALL native dispatch
     assert 'data.startswith("hctl:")' in src
-    assert src.index('data.startswith("hctl:")') < src.index("prefix, body"), "hctl branch must run before native prefixes"
-    # panel command handler registered alongside native ones
+    assert src.index('data.startswith("hctl:")') < src.index("self._handle_model_picker_callback"), \
+        "hctl branch must run before native prefixes"
+    # panel command registered in the handler-setup block
+    cls_src = inspect.getsource(ad.TelegramAdapter)
+    assert 'CommandHandler("panel"' in cls_src, "panel command registration missing"
     assert hasattr(ad.TelegramAdapter, "_handle_cpanel_command")
