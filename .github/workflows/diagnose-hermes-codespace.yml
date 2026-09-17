@@ -1,107 +1,25 @@
-name: cpanel-deploy3
+name: cpanel-healthcheck
 on:
   workflow_dispatch:
 jobs:
-  deploy:
+  check:
     runs-on: ubuntu-latest
     steps:
-      - name: Reset to branch tip, re-patch, run tests with full output
+      - name: Read gateway log tail + process state (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
-          PUSH_TOK: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
         run: |
           set -euo pipefail
-          gh codespace ssh --codespace "$NEW_CS" -- env PUSH_TOK="${GH_TOKEN}" bash -s <<'REMOTE' 2>&1
+          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
           set -euo pipefail
-          R=/home/codespace/.hermes/hermes-agent
-          cd "$R"
-          g(){ git -c safe.directory='*' "$@"; }
-          echo "===== 0) reset to new branch tip (stall patched files) ====="
-          g stash push -q -m cpanel-patched 2>&1 | tail -1 || true
-          g fetch origin hermes-cpanel 2>&1 | tail -1
-          g checkout -B hermes-cpanel origin/hermes-cpanel 2>&1 | tail -1
-          g rev-parse --short HEAD
-          echo "===== 1) re-apply patch (idempotent) ====="
-          venv/bin/python /tmp/cp_patch.py
-          echo "===== 2) real-module integration diagnostics ====="
-          venv/bin/python - <<'PYX'
-          import inspect
-          import hermes_cli.config as hc
-          print("read_user_config_raw sig:", inspect.signature(hc.read_user_config_raw))
-          from providers import list_providers
-          profs = {p.name: p for p in list_providers() if getattr(p, "name", "")}
-          g = profs.get("gemini")
-          if g:
-              print("google profile attrs:", sorted(k for k in vars(g).keys())[:30])
-              print("google env_vars:", getattr(g, "env_vars", None), "| base_url:", getattr(g, "base_url", None))
-          else:
-              print("providers names:", sorted(profs.keys()))
-          import gateway.pairing as gp
-          print("pairing has _configured_allowlist:", hasattr(gp, "_configured_allowlist"))
-          from agent.i18n import t, reset_language_cache
-          reset_language_cache()
-          print("t(cpanel.main.title):", repr(t("cpanel.main.title")))
-          print("t(cpanel.back):", repr(t("cpanel.back")))
-          PYX
-          echo "===== 3) pytest cpanel (full output) ====="
-          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q --tb=short 2>&1 | tail -120
-          REMOTE
-      - name: Commit patches, push, restart gateway, verify
-        env:
-          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-          NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
-          PUSH_TOK: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-        run: |
-          set -euo pipefail
-          gh codespace ssh --codespace "$NEW_CS" -- env PUSH_TOK="${GH_TOKEN}" bash -s <<'REMOTE' 2>&1
-          set -euo pipefail
-          mask(){ sed -E 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/[redacted-token]/g'; }
-          R=/home/codespace/.hermes/hermes-agent
-          cd "$R"
-          g(){ git -c safe.directory='*' "$@"; }
-          echo "===== 4) test gate re-check + commit ====="
-          venv/bin/python -m pytest tests/gateway/test_cpanel.py -q > /tmp/pt.out 2>&1 && echo "PYTEST_OK $(tail -1 /tmp/pt.out)" || { echo "STOP PYTEST_FAILED"; tail -40 /tmp/pt.out; exit 3; }
-          g add plugins/platforms/telegram/adapter.py agent/i18n.py locales/
-          g -c user.name="velora-ops" -c user.email="ops@veloratrade.local" commit -m "cpanel: adapter hctl wiring + /panel command + fa i18n + locale stubs" 2>&1 | tail -2
-          echo "===== 5) push branch ====="
-          if ! g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" push origin hermes-cpanel 2>&1 | mask; then
-            echo "STOP PUSH_REJECTED"; exit 10
-          fi
-          sleep 4
-          RSHA=$(g -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "${PUSH_TOK}" | base64 -w0)" ls-remote origin refs/heads/hermes-cpanel | awk '{print $1}')
-          LSHA=$(g rev-parse HEAD)
-          echo "local: $LSHA"; echo "remote: $RSHA"
-          [ "$RSHA" = "$LSHA" ] || { echo "STOP LSREMOTE_MISMATCH"; exit 11; }
-          echo "PUSH_VERIFIED"
-          echo "===== 6) gateway restart (process only, persistent log) ====="
-          OLD=$(pgrep -f 'hermes gateway' | head -1 || true)
-          [ -n "$OLD" ] && kill -TERM "$OLD" 2>/dev/null || true
-          for i in $(seq 1 20); do sleep 2; pgrep -f 'hermes gateway' >/dev/null || break; done
-          cd /home/codespace
-          nohup $R/venv/bin/hermes gateway --accept-hooks run >> /home/codespace/.hermes/state/hermes-gateway.log 2>&1 &
-          NP=$!; echo "new gateway pid: $NP"
-          ok=0
-          for i in $(seq 1 45); do
-            sleep 4
-            if [ -f /home/codespace/.hermes/state/gateway.heartbeat ]; then
-              AGE=$(( $(date +%s) - $(stat -c %Y /home/codespace/.hermes/state/gateway.heartbeat) ))
-              [ "$AGE" -lt 60 ] && { ok=1; echo "heartbeat fresh at poll $i (${AGE}s)"; break; }
-            fi
-          done
-          [ "$ok" = "1" ] || { echo "STOP GATEWAY_NO_HEARTBEAT"; tail -20 /home/codespace/.hermes/state/hermes-gateway.log | sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted]/g'; exit 12; }
-          pgrep -fc 'hermes gateway' | sed 's/^/gateway processes: /'
-          echo "===== 7) panel smoke: render every screen offline ====="
-          cd "$R"
-          venv/bin/python - <<'PYD'
-          import gateway.cpanel as cp
-          class A: pass
-          a=A(); a._save_gateway_config_key=None
-          for name,fn in [("main",cp.screen_main),("providers",cp.screen_providers),("models",cp.screen_models),
-                          ("test",cp.screen_test),("status",cp.screen_status),("users",cp.screen_users),
-                          ("settings",cp.screen_settings),("logs",cp.screen_logs),("backup",cp.screen_backup)]:
-              t,k=fn(a); assert t and k is not None, name
-          print("SMOKE_OK 9 screens rendered")
-          PYD
-          echo "===== CPANEL_DEPLOY=DONE ====="
+          mask(){ sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/[redacted-token]/g; s/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/[redacted]/g; s/AIza[0-9A-Za-z_-]{20,}/[redacted-gemini]/g'; }
+          echo "===== processes ====="
+          pgrep -af 'hermes gateway' | mask
+          echo "===== heartbeat age ====="
+          HB=/home/codespace/.hermes/state/gateway.heartbeat
+          [ -f "$HB" ] && echo "heartbeat age: $(( $(date +%s) - $(stat -c %Y "$HB") ))s"
+          echo "===== gateway log tail (sanitized) ====="
+          tail -40 /home/codespace/.hermes/state/hermes-gateway.log | mask | grep -avi "debug" | tail -25
+          echo "===== CHECK=DONE ====="
           REMOTE
