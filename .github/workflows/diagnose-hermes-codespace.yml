@@ -55,19 +55,23 @@ jobs:
           echo "=== SUITE: native telegram auth + fail-closed + custom-provider runtime ==="
           pytest -q tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py tests/gateway/test_custom_provider_request_overrides.py 2>&1 | mask | tail -4
           echo "TEST_GATES=DONE"
+          # graceful stop, then deterministic start (native singleton lock protects
+          # against the external ~15-min supervisor spawning a duplicate)
           pkill -f 'hermes gateway' || true
-          sleep 8
-          UP=""
-          for i in $(seq 1 180); do
-            if pgrep -f 'hermes gateway' >/dev/null; then UP=1; break; fi
-            sleep 5
-          done
-          [ -n "$UP" ] || { echo "FAIL: gateway did not come back within 15 minutes"; exit 4; }
-          echo "GATEWAY_UP_AFTER=$(( i*5 ))s"
+          for i in $(seq 1 24); do pgrep -f 'hermes gateway' >/dev/null || break; sleep 5; done
+          if pgrep -f 'hermes gateway' >/dev/null; then pkill -9 -f 'hermes gateway' || true; sleep 3; fi
+          cd "$R"
+          setsid nohup "$R/venv/bin/python" "$R/hermes" gateway --accept-hooks run >> /home/codespace/.hermes/state/hermes-gateway.log 2>&1 < /dev/null &
+          sleep 25
           pgrep -af 'hermes gateway' | mask
+          pgrep -f 'hermes gateway' >/dev/null || { echo "FAIL: manual gateway start did not stay up"; tail -20 /home/codespace/.hermes/state/hermes-gateway.log | mask; exit 4; }
           # give telegram polling a moment, then require a FRESH heartbeat
-          sleep 10
           HB=/home/codespace/.hermes/state/gateway.heartbeat
+          for i in $(seq 1 12); do
+            sleep 10
+            AGE=$(( $(date +%s) - $(stat -c %Y "$HB") ))
+            [ "$AGE" -le 60 ] && break
+          done
           AGE=$(( $(date +%s) - $(stat -c %Y "$HB") ))
           echo "heartbeat age: ${AGE}s"
           [ "$AGE" -le 90 ] || { echo "FAIL: stale heartbeat (${AGE}s)"; exit 5; }
