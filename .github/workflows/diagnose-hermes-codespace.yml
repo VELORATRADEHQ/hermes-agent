@@ -29,211 +29,211 @@ jobs:
           venv/bin/python -c "from agent.i18n import t; print(repr(t('cpanel.back')))" || true
           echo "===== 2) apply patch ====="
           cat > /tmp/cp_patch.py <<'PYPATCH'
-            #!/usr/bin/env python3
-            """Apply the Control Panel's minimal in-tree patches (idempotent, assertion-guarded).
+          #!/usr/bin/env python3
+          """Apply the Control Panel's minimal in-tree patches (idempotent, assertion-guarded).
 
-            Edits, precisely:
-              adapters: plugins/platforms/telegram/adapter.py  (4 anchored insertions)
-              i18n:     agent/i18n.py                        ("fa" added to SUPPORTED_LANGUAGES)
-              locales:  append the cpanel.* English stub key block to all locales/*.yaml EXCEPT fa.yaml
-                        (fa.yaml ships fully translated from the branch)
-            Anchor failure anywhere => hard exit before any partial second half is applied.
-            """
-            import re
-            import sys
-            from pathlib import Path
+          Edits, precisely:
+            adapters: plugins/platforms/telegram/adapter.py  (4 anchored insertions)
+            i18n:     agent/i18n.py                        ("fa" added to SUPPORTED_LANGUAGES)
+            locales:  append the cpanel.* English stub key block to all locales/*.yaml EXCEPT fa.yaml
+                      (fa.yaml ships fully translated from the branch)
+          Anchor failure anywhere => hard exit before any partial second half is applied.
+          """
+          import re
+          import sys
+          from pathlib import Path
 
-            REPO = Path("/home/codespace/.hermes/hermes-agent")
-            ADAPTER = REPO / "plugins/platforms/telegram/adapter.py"
-            I18N = REPO / "agent/i18n.py"
-            LOCALES = REPO / "locales"
+          REPO = Path("/home/codespace/.hermes/hermes-agent")
+          ADAPTER = REPO / "plugins/platforms/telegram/adapter.py"
+          I18N = REPO / "agent/i18n.py"
+          LOCALES = REPO / "locales"
 
-            EN_CPANEL_BLOCK = '''cpanel:
-              back: "Back"
-              close: "Close"
-              edit: "Edit (restart wizard)"
-              save: "Save"
-              cancel: "Cancel"
-              refresh: "Refresh"
-              error: "\\u26a0\\ufe0f Operation failed - details were logged (sanitized)."
-              ai:
-                unknown: "not tested yet (explicit tests only)"
-              main:
-                title: "\\U0001f6e1\\ufe0f Hermes Control"
-                provider: "Provider"
-                ai: "AI availability"
-                hint: "Choose a section. All operations are local - no AI call."
-              m:
-                providers: "\\U0001f511 Providers"
-                models: "\\U0001f916 Models"
-                test: "\\U0001f9ea Test Connection"
-                status: "\\U0001f4ca System Status"
-                users: "\\U0001f464 Users"
-                settings: "\\u2699\\ufe0f Settings"
-                logs: "\\U0001f4cb Logs"
-                backup: "\\U0001f4be Backup / Restore"
-              prov:
-                title: "\\U0001f511 Provider Management"
-                legend: "\\U0001f7e2 enabled - \\u26aa disabled - \\u2b50 default - tap a provider for actions"
-                add: "Add Provider"
-                gone: "Provider not found."
-                status: "Status"
-                default: "Default"
-                auth: "Auth"
-                key: "API key"
-                editkey: "Rotate key"
-                setdefault: "Set default"
-                test: "Test"
-                delkey: "Delete key"
-                mkdefault:
-                  done: "Default provider saved. Model stays: "
-              models:
-                title: "\\U0001f916 Model Management"
-                provider: "Provider"
-                active: "Active model"
-                pick: "Tap to set as active (saved to config; no AI call):"
-                none: "No model catalog cached for this provider. Run Test (lists models on success) or type a model id below."
-                type: "Type model id"
-                testsel: "Test current selection"
-                typeask: "Send the model id as a normal message now."
-              test:
-                title: "\\U0001f9ea Connection Test"
-                desc: "Explicit provider/API connectivity check. Single attempt, no auto-retry. Never faked."
-                selected: "Selected"
-                run: "Run test"
-                running: "Testing..."
-                result: "Test result"
-                oknote: "Provider API reachable. (Connectivity only - not an inference check.)"
-                quota: "Reason: provider quota/rate limit (e.g. Google RESOURCE_EXHAUSTED). This is NOT a Hermes failure."
-                auth: "Reason: authentication failed - check the stored key."
-                net: "Reason: network failure."
-                perr: "Reason: provider-side error (5xx). Known transient capacity states are shown as-is."
-                nokey: "Reason: credential not configured."
-                other: "See status code above."
-              status:
-                title: "\\U0001f4ca System Status"
-                note: "Infrastructure status is independent of AI provider health."
-              users:
-                title: "\\U0001f464 User Management"
-                pending: "Pending requests"
-                approve: "Approve"
-                approved: "Approved users"
-                revoke: "Revoke"
-                note: "Codes are never displayed. Rejected/ignored requests expire automatically."
-              settings:
-                title: "\\u2699\\ufe0f Hermes Settings"
-                lang: "Language (display.language)"
-                comp: "Context compression (compression.enabled)"
-                note: "Only settings Hermes already supports are editable here."
-              logs:
-                title: "\\U0001f4cb Logs (sanitized)"
-                unavail: "log unavailable: "
-              backup:
-                title: "\\U0001f4be Backup / Restore"
-                covers: "Covers: config.yaml, auth.json (600), .env (600) - stored locally, never uploaded."
-                create: "Create backup now"
-                recent: "Recent snapshots:"
-                restore: "Restore"
-              confirm:
-                title: "\\u26a0\\ufe0f Confirm"
-                note: "This action is explicit and deliberate."
-                yes: "Confirm"
-                no: "Cancel"
-              add:
-                title: "\\u2795 Add Provider"
-                pick: "Choose provider type (only providers Hermes actually supports are listed):"
-                keyask: "Send the API key as a normal message now."
-                keynote: "It will be stored locally (600), shown masked, and your message will be deleted."
-                nokey: "This provider type does not take an API key here."
-                confirm: "Provider configuration"
-                saved: "Saved (no AI call made)."
-                keyrot: "Key rotated (stored locally, masked): "
-                modelask: "API key captured (masked): "
-                modelpick: "Pick a default model:"
-                skipmodel: "Skip / set later"
-            '''
-
-
-            def patch_adapter() -> None:
-                src = ADAPTER.read_text()
-                if "hctl:" in src and "_handle_cpanel_command" in src:
-                    print("adapter: already patched (idempotent skip)")
-                    return
-                edits = []
-
-                a1_old = "app.add_handler(CallbackQueryHandler(self._handle_callback_query))"
-                a1_new = (a1_old + "\n"
-                          '        app.add_handler(CommandHandler("panel", self._handle_cpanel_command))')
-                edits.append(("panel CommandHandler", a1_old, a1_new, 1))
-
-                a2_old = "        data = query.data\n"
-                a2_new = a2_old + ('        if data.startswith("hctl:"):\n'
-                                   "            from gateway.cpanel import handle_callback as _cpanel_cb\n"
-                                   "            await _cpanel_cb(self, query, data)\n"
-                                   "            return\n")
-                edits.append(("hctl callback branch", a2_old, a2_new, 1))
-
-                a3_old = "    async def _claim_callback_state("
-                a3_new = ('    async def _handle_cpanel_command(self, update, context):\n'
-                          "        \"\"\"`/panel` -- open the AI-independent Hermes control panel.\"\"\"\n"
-                          "        from gateway.cpanel import handle_command as _cpanel_cmd\n"
-                          "        await _cpanel_cmd(self, update, context)\n\n"
-                          "    async def _cpanel_consume_pending(self, update, context) -> bool:\n"
-                          "        from gateway.cpanel import consume_pending_input as _cpanel_pi\n"
-                          "        return await _cpanel_pi(self, update, context)\n\n"
-                          + a3_old)
-                edits.append(("cpanel methods", a3_old, a3_new, 1))
-
-                m = re.search(r"^    async def _handle_text_message\(self, update: Update, context: .*\) -> None:\n", src, re.M)
-                if not m:
-                    print("ANCHOR FAIL: _handle_text_message def not found"); sys.exit(3)
-                a4_old = m.group(0)
-                a4_new = a4_old + ("        if await self._cpanel_consume_pending(update, context):\n"
-                                   "            return\n")
-                edits.append(("pending-input interception", a4_old, a4_new, 1))
-
-                for name, old, new, count in edits:
-                    n = src.count(old)
-                    if n != count:
-                        print(f"ANCHOR FAIL: {name}: expected 1 occurrence, got {n}"); sys.exit(4)
-                    src = src.replace(old, new, 1)
-                ADAPTER.write_text(src)
-                print("adapter: 4 insertions applied")
+          EN_CPANEL_BLOCK = '''cpanel:
+            back: "Back"
+            close: "Close"
+            edit: "Edit (restart wizard)"
+            save: "Save"
+            cancel: "Cancel"
+            refresh: "Refresh"
+            error: "\\u26a0\\ufe0f Operation failed - details were logged (sanitized)."
+            ai:
+              unknown: "not tested yet (explicit tests only)"
+            main:
+              title: "\\U0001f6e1\\ufe0f Hermes Control"
+              provider: "Provider"
+              ai: "AI availability"
+              hint: "Choose a section. All operations are local - no AI call."
+            m:
+              providers: "\\U0001f511 Providers"
+              models: "\\U0001f916 Models"
+              test: "\\U0001f9ea Test Connection"
+              status: "\\U0001f4ca System Status"
+              users: "\\U0001f464 Users"
+              settings: "\\u2699\\ufe0f Settings"
+              logs: "\\U0001f4cb Logs"
+              backup: "\\U0001f4be Backup / Restore"
+            prov:
+              title: "\\U0001f511 Provider Management"
+              legend: "\\U0001f7e2 enabled - \\u26aa disabled - \\u2b50 default - tap a provider for actions"
+              add: "Add Provider"
+              gone: "Provider not found."
+              status: "Status"
+              default: "Default"
+              auth: "Auth"
+              key: "API key"
+              editkey: "Rotate key"
+              setdefault: "Set default"
+              test: "Test"
+              delkey: "Delete key"
+              mkdefault:
+                done: "Default provider saved. Model stays: "
+            models:
+              title: "\\U0001f916 Model Management"
+              provider: "Provider"
+              active: "Active model"
+              pick: "Tap to set as active (saved to config; no AI call):"
+              none: "No model catalog cached for this provider. Run Test (lists models on success) or type a model id below."
+              type: "Type model id"
+              testsel: "Test current selection"
+              typeask: "Send the model id as a normal message now."
+            test:
+              title: "\\U0001f9ea Connection Test"
+              desc: "Explicit provider/API connectivity check. Single attempt, no auto-retry. Never faked."
+              selected: "Selected"
+              run: "Run test"
+              running: "Testing..."
+              result: "Test result"
+              oknote: "Provider API reachable. (Connectivity only - not an inference check.)"
+              quota: "Reason: provider quota/rate limit (e.g. Google RESOURCE_EXHAUSTED). This is NOT a Hermes failure."
+              auth: "Reason: authentication failed - check the stored key."
+              net: "Reason: network failure."
+              perr: "Reason: provider-side error (5xx). Known transient capacity states are shown as-is."
+              nokey: "Reason: credential not configured."
+              other: "See status code above."
+            status:
+              title: "\\U0001f4ca System Status"
+              note: "Infrastructure status is independent of AI provider health."
+            users:
+              title: "\\U0001f464 User Management"
+              pending: "Pending requests"
+              approve: "Approve"
+              approved: "Approved users"
+              revoke: "Revoke"
+              note: "Codes are never displayed. Rejected/ignored requests expire automatically."
+            settings:
+              title: "\\u2699\\ufe0f Hermes Settings"
+              lang: "Language (display.language)"
+              comp: "Context compression (compression.enabled)"
+              note: "Only settings Hermes already supports are editable here."
+            logs:
+              title: "\\U0001f4cb Logs (sanitized)"
+              unavail: "log unavailable: "
+            backup:
+              title: "\\U0001f4be Backup / Restore"
+              covers: "Covers: config.yaml, auth.json (600), .env (600) - stored locally, never uploaded."
+              create: "Create backup now"
+              recent: "Recent snapshots:"
+              restore: "Restore"
+            confirm:
+              title: "\\u26a0\\ufe0f Confirm"
+              note: "This action is explicit and deliberate."
+              yes: "Confirm"
+              no: "Cancel"
+            add:
+              title: "\\u2795 Add Provider"
+              pick: "Choose provider type (only providers Hermes actually supports are listed):"
+              keyask: "Send the API key as a normal message now."
+              keynote: "It will be stored locally (600), shown masked, and your message will be deleted."
+              nokey: "This provider type does not take an API key here."
+              confirm: "Provider configuration"
+              saved: "Saved (no AI call made)."
+              keyrot: "Key rotated (stored locally, masked): "
+              modelask: "API key captured (masked): "
+              modelpick: "Pick a default model:"
+              skipmodel: "Skip / set later"
+          '''
 
 
-            def patch_i18n() -> None:
-                src = I18N.read_text()
-                if '"fa"' in src.split("SUPPORTED_LANGUAGES")[1].split(")")[0]:
-                    print("i18n: fa already present (idempotent skip)")
-                    return
-                old = '    "af", "ko", "it", "ga", "pt", "ru", "hu", "ar",\n'
-                if src.count(old) != 1:
-                    print("ANCHOR FAIL: SUPPORTED_LANGUAGES line"); sys.exit(5)
-                new = '    "af", "ko", "it", "ga", "pt", "ru", "hu", "ar", "fa",\n'
-                I18N.write_text(src.replace(old, new, 1))
-                print("i18n: fa added")
+          def patch_adapter() -> None:
+              src = ADAPTER.read_text()
+              if "hctl:" in src and "_handle_cpanel_command" in src:
+                  print("adapter: already patched (idempotent skip)")
+                  return
+              edits = []
+
+              a1_old = "app.add_handler(CallbackQueryHandler(self._handle_callback_query))"
+              a1_new = (a1_old + "\n"
+                        '        app.add_handler(CommandHandler("panel", self._handle_cpanel_command))')
+              edits.append(("panel CommandHandler", a1_old, a1_new, 1))
+
+              a2_old = "        data = query.data\n"
+              a2_new = a2_old + ('        if data.startswith("hctl:"):\n'
+                                 "            from gateway.cpanel import handle_callback as _cpanel_cb\n"
+                                 "            await _cpanel_cb(self, query, data)\n"
+                                 "            return\n")
+              edits.append(("hctl callback branch", a2_old, a2_new, 1))
+
+              a3_old = "    async def _claim_callback_state("
+              a3_new = ('    async def _handle_cpanel_command(self, update, context):\n'
+                        "        \"\"\"`/panel` -- open the AI-independent Hermes control panel.\"\"\"\n"
+                        "        from gateway.cpanel import handle_command as _cpanel_cmd\n"
+                        "        await _cpanel_cmd(self, update, context)\n\n"
+                        "    async def _cpanel_consume_pending(self, update, context) -> bool:\n"
+                        "        from gateway.cpanel import consume_pending_input as _cpanel_pi\n"
+                        "        return await _cpanel_pi(self, update, context)\n\n"
+                        + a3_old)
+              edits.append(("cpanel methods", a3_old, a3_new, 1))
+
+              m = re.search(r"^    async def _handle_text_message\(self, update: Update, context: .*\) -> None:\n", src, re.M)
+              if not m:
+                  print("ANCHOR FAIL: _handle_text_message def not found"); sys.exit(3)
+              a4_old = m.group(0)
+              a4_new = a4_old + ("        if await self._cpanel_consume_pending(update, context):\n"
+                                 "            return\n")
+              edits.append(("pending-input interception", a4_old, a4_new, 1))
+
+              for name, old, new, count in edits:
+                  n = src.count(old)
+                  if n != count:
+                      print(f"ANCHOR FAIL: {name}: expected 1 occurrence, got {n}"); sys.exit(4)
+                  src = src.replace(old, new, 1)
+              ADAPTER.write_text(src)
+              print("adapter: 4 insertions applied")
 
 
-            def patch_locales() -> None:
-                done = []
-                for yf in sorted(LOCALES.glob("*.yaml")):
-                    if yf.name == "fa.yaml":
-                        continue
-                    txt = yf.read_text()
-                    if "\ncpanel:" in txt or txt.startswith("cpanel:"):
-                        done.append(yf.name + " (already)")
-                        continue
-                    with yf.open("a") as fh:
-                        fh.write("\n" + EN_CPANEL_BLOCK)
-                    done.append(yf.name)
-                print("locales: cpanel stub appended to:", ", ".join(done))
+          def patch_i18n() -> None:
+              src = I18N.read_text()
+              if '"fa"' in src.split("SUPPORTED_LANGUAGES")[1].split(")")[0]:
+                  print("i18n: fa already present (idempotent skip)")
+                  return
+              old = '    "af", "ko", "it", "ga", "pt", "ru", "hu", "ar",\n'
+              if src.count(old) != 1:
+                  print("ANCHOR FAIL: SUPPORTED_LANGUAGES line"); sys.exit(5)
+              new = '    "af", "ko", "it", "ga", "pt", "ru", "hu", "ar", "fa",\n'
+              I18N.write_text(src.replace(old, new, 1))
+              print("i18n: fa added")
 
 
-            if __name__ == "__main__":
-                patch_adapter()
-                patch_i18n()
-                patch_locales()
-                print("CPATCH=DONE")
+          def patch_locales() -> None:
+              done = []
+              for yf in sorted(LOCALES.glob("*.yaml")):
+                  if yf.name == "fa.yaml":
+                      continue
+                  txt = yf.read_text()
+                  if "\ncpanel:" in txt or txt.startswith("cpanel:"):
+                      done.append(yf.name + " (already)")
+                      continue
+                  with yf.open("a") as fh:
+                      fh.write("\n" + EN_CPANEL_BLOCK)
+                  done.append(yf.name)
+              print("locales: cpanel stub appended to:", ", ".join(done))
+
+
+          if __name__ == "__main__":
+              patch_adapter()
+              patch_i18n()
+              patch_locales()
+              print("CPATCH=DONE")
           PYPATCH
           venv/bin/python /tmp/cp_patch.py
           echo "===== 3) t() sanity AFTER patch ====="
