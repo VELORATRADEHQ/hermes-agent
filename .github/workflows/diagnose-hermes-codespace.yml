@@ -1,108 +1,43 @@
-name: canonical-repo-migration
+name: canonical-repo-migration-finalize2
 on:
   workflow_dispatch:
 jobs:
-  migrate:
+  migrate3:
     runs-on: ubuntu-latest
     steps:
-      - name: Verify PINNED state (STOP on drift)
+      - name: Absorb latest remote tip (guarded), push, verify
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
         run: |
-          set -uo pipefail
+          set -euo pipefail
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
-          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
-          cd /home/codespace/.hermes/hermes-agent
-          g(){ git -c safe.directory='*' "$@"; }
-          [ "$(g rev-parse HEAD)" = "5d59366010640c1d6b8f170d8a4ee109db2bbdef" ] || { echo "STOP HEAD_DRIFT"; exit 2; }
-          X=$(g status --porcelain=v1 | grep -vc '^?? venv$' || true)
-          [ "$X" = "0" ] || { echo "STOP STATUS_DRIFT"; g status --porcelain=v1 | head; exit 3; }
-          grep -q '^version = "0.21.3"' pyproject.toml || { echo "STOP VERSION_DRIFT"; exit 4; }
-          echo "VERIFY_OK head=pinned clean(except venv symlink) version=0.21.3"
-          REMOTE
-      - name: Merge automation history into Hermes history (no force, no loss)
-        env:
-          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-          NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
-        run: |
-          set -euo pipefail
-          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
-          set -euo pipefail
-          cd /home/codespace/.hermes/hermes-agent
-          g(){ git -c safe.directory='*' "$@"; }
-          g fetch https://github.com/VELORATRADEHQ/hermes-agent.git main 2>&1 | tail -2
-          AUTO=$(g rev-parse FETCH_HEAD); echo "automation main: $AUTO"
-          if g merge-base HEAD FETCH_HEAD >/dev/null 2>&1; then echo "STOP RELATED_HISTORIES"; exit 5; fi
-          g branch -f main HEAD; g checkout main 2>&1 | tail -1
-          if ! g merge --allow-unrelated-histories --no-edit FETCH_HEAD; then
-            CONFLICTS=$(g diff --name-only --diff-filter=U)
-            echo "conflicts: $CONFLICTS"
-            if [ "$CONFLICTS" = "README.md" ]; then
-              echo "resolving sole README.md conflict with Hermes version (automation README was a placeholder)"
-              g checkout --ours README.md; g add README.md; g commit --no-edit
-            else
-              g merge --abort || true; g checkout --detach HEAD; echo "STOP MERGE_CONFLICT"; exit 6
-            fi
-          fi
-          echo "MERGED_HEAD=$(g rev-parse HEAD)"
-          echo "--- tree delta vs pinned hermes head (must be .github additions only):"
-          g diff --stat 5d59366010640c1d6b8f170d8a4ee109db2bbdef..HEAD
-          REMOTE
-      - name: Secret re-scan on final tree (fixture-only classification allowed)
-        env:
-          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-          NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
-        run: |
-          set -uo pipefail
-          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
-          cd /home/codespace/.hermes/hermes-agent
-          venv/bin/python - <<'PYEOF'
-          import re, subprocess, collections, sys
-          pats = {
-            'telegram_bot_token': r'\b\d{6,}:[A-Za-z0-9_-]{30,}',
-            'openai_style_sk':  r'\bsk-[A-Za-z0-9_-]{20,}',
-            'gemini_aq':        r'\bAQ\.[A-Za-z0-9_-]{8,}',
-            'google_aiza':      r'\bAIza[0-9A-Za-z_-]{20,}',
-            'github_pat':       r'\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}',
-            'aws_akia':         r'\bAKIA[0-9A-Z]{16}',
-            'slack_xox':        r'\bxox[bpoas]-[A-Za-z0-9-]{10,}',
-            'private_key_pem':  r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----',
-          }
-          files = subprocess.run(['git','-c','safe.directory=*','ls-files'], capture_output=True, text=True).stdout.splitlines()
-          real=[]; fixtures=collections.Counter()
-          for f in files:
-            lf=f.lower()
-            if lf.endswith('auth.json') or lf=='.env' or re.search(r'(^|/)\.env(\.|$)', lf):
-              real.append(f'CREDENTIAL_FILE_TRACKED {f}'); continue
-            if any(x in f for x in ('venv/','.venv/','backups/')): continue
-            try: data=open(f,'rb').read(400000).decode('utf-8','ignore')
-            except Exception: continue
-            for name,rx in pats.items():
-              if re.search(rx,data):
-                if f.startswith(('tests/','evals/','skills/','website/')) or f.endswith('.example'):
-                  fixtures[name]+=1
-                else: real.append(f'{name} :: {f}')
-          print('tracked files scanned:', len(files))
-          print('fixture-only hits (upstream tests/docs):', dict(fixtures))
-          if real:
-            print('STOP REAL_SECRET_FOUND'); [print('REAL:', r[:80]) for r in real[:10]]; sys.exit(7)
-          print('SCAN SAFE — no real credentials in final tree')
-          PYEOF
-          REMOTE
-      - name: Set remotes, push to canonical (no force), verify
-        env:
-          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-          NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
-        run: |
-          set -euo pipefail
           gh codespace ssh --codespace "$NEW_CS" -- env PUSH_TOK="${GH_TOKEN}" bash -s <<'REMOTE' 2>&1
           set -euo pipefail
           mask(){ sed -E 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/[redacted-token]/g'; }
           cd /home/codespace/.hermes/hermes-agent
           g(){ git -c safe.directory='*' "$@"; }
-          g remote rename origin upstream
-          g remote add origin https://github.com/VELORATRADEHQ/hermes-agent.git
+          [ "$(g rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "STOP NOT_ON_MAIN"; exit 2; }
+          X=$(g status --porcelain=v1 | grep -vc '^?? venv$' || true)
+          [ "$X" = "0" ] || { echo "STOP STATUS_DRIFT"; g status; exit 3; }
+          g fetch https://github.com/VELORATRADEHQ/hermes-agent.git main 2>&1 | tail -1
+          FT=$(g rev-parse FETCH_HEAD)
+          if g merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "remote tip already absorbed: $FT"
+          else
+            MB=$(g merge-base HEAD FETCH_HEAD)
+            DELTA=$(g diff --name-only "$MB"..FETCH_HEAD)
+            echo "remote-side delta since merge-base $MB: $DELTA"
+            for f in $DELTA; do
+              case "$f" in .github/workflows/*) : ;; *) echo "STOP UNEXPECTED_REMOTE_CHANGE $f"; exit 4;; esac
+            done
+            g merge --no-edit FETCH_HEAD
+            echo "absorbed tip, merged head: $(g rev-parse HEAD)"
+          fi
+          if ! g remote get-url upstream 2>/dev/null | grep -q 'NousResearch/hermes-agent.git'; then
+            g remote rename origin upstream
+          fi
+          g remote get-url origin >/dev/null 2>&1 && g remote set-url origin https://github.com/VELORATRADEHQ/hermes-agent.git || g remote add origin https://github.com/VELORATRADEHQ/hermes-agent.git
           echo "--- remotes:"; g remote -v
           g remote get-url upstream | grep -q 'github.com/NousResearch/hermes-agent.git' || { echo "STOP UPSTREAM_WRONG"; exit 8; }
           g remote get-url origin | grep -q 'github.com/VELORATRADEHQ/hermes-agent.git' || { echo "STOP ORIGIN_WRONG"; exit 9; }
@@ -115,21 +50,12 @@ jobs:
           RSHA=$(g -c http.extraheader="Authorization: Bearer ${PUSH_TOK}" ls-remote origin refs/heads/main | awk '{print $1}')
           LSHA=$(g rev-parse HEAD)
           echo "local HEAD:  $LSHA"; echo "remote main: $RSHA"
-          [ "$RSHA" = "$LSHA" ] || { echo "STOP LSREMOTE_MISMATCH"; exit 11; }
-          g branch -u origin/main main
+          [ "$RSHA" = "$LSHA" ] || { echo "STOP LSREMOTE_MISMATCH local=$LSHA remote=$RSHA"; exit 11; }
+          g branch -u origin/main main 2>&1 | tail -1
           echo "PUSH_VERIFIED"
-          REMOTE
-      - name: Post-verify (imports, version, tree)
-        env:
-          GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-          NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
-        run: |
-          set -uo pipefail
-          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
-          cd /home/codespace/.hermes/hermes-agent
           venv/bin/python -c "import gateway, plugins.platforms.telegram.adapter, providers; print('IMPORT_OK')"
           grep -m1 '^version' pyproject.toml
-          git -c safe.directory='*' status --porcelain=v1
           echo "gateway still running: $(pgrep -fc 'hermes gateway' || echo 0)"
+          echo "tracked .github files:"; g ls-files .github
           echo "===== CANONICAL_MIGRATION=DONE ====="
           REMOTE
