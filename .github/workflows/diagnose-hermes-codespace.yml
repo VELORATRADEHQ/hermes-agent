@@ -1,11 +1,11 @@
-name: post-migration-reverify
+name: cp-implementation-read
 on:
   workflow_dispatch:
 jobs:
-  migrate3:
+  read:
     runs-on: ubuntu-latest
     steps:
-      - name: Post-migration re-verify (read-only)
+      - name: Implementation-surface read (read-only)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
           NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
@@ -13,15 +13,41 @@ jobs:
           set -uo pipefail
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
           gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
-          cd /home/codespace/.hermes/hermes-agent
-          g(){ git -c safe.directory='*' "$@"; }
-          echo "pwd: $(pwd)"
-          echo "branch: $(g rev-parse --abbrev-ref HEAD)"
-          echo "HEAD: $(g rev-parse HEAD)"
-          echo "--- remotes:"; g remote -v
-          echo "--- status:"; g status --porcelain=v1
-          echo "version: $(grep -m1 '^version' pyproject.toml)"
-          venv/bin/python -c "import gateway, plugins.platforms.telegram.adapter, providers; print('IMPORT_OK')"
-          echo "gateway running: $(pgrep -fc 'hermes gateway' || echo 0)"
-          echo "===== REVERIFY=DONE ====="
+          R=/home/codespace/.hermes/hermes-agent
+          A="$R/plugins/platforms/telegram/adapter.py"
+          echo "===== S1) slash text routing in adapter ====="
+          grep -nE '"(/(model|status|fast|reasoning|new|help))"' "$A" | head -10
+          grep -nE 'def _.*(slash|command)' "$A" | head -8
+          echo "===== S2) callback ctx + auth + edit helpers ====="
+          grep -n 'def _callback_ctx' "$A"; sed -n "$(grep -n 'def _callback_ctx' "$A" | cut -d: -f1),+16p" "$A"
+          grep -n 'def _callback_authorized' "$A"; sed -n "$(grep -n 'def _callback_authorized' "$A" | cut -d: -f1),+14p" "$A"
+          grep -n 'def _edit_md_quiet' "$A"; sed -n "$(grep -n 'def _edit_md_quiet' "$A" | cut -d: -f1),+10p" "$A"
+          grep -n 'def _send_control_message' "$A"; sed -n "$(grep -n 'def _send_control_message' "$A" | cut -d: -f1),+18p" "$A"
+          echo "===== S3) slash command dispatch (typed) ====="
+          grep -nE 'slash_commands|GatewaySlashCommandsMixin|_handle_slash' "$R/gateway/run.py" 2>/dev/null | head -6
+          grep -rnE "('/model'|"/model")" "$R/gateway/slash_commands.py" | head -4
+          grep -nE 'def (build_|register_|_cmd_)' "$R/gateway/slash_commands.py" | head -12
+          echo "===== S4) menu builder ====="
+          grep -nE 'def (telegram_menu_commands|telegram_menu_max_commands)|_DEFAULT_TELEGRAM' "$R/hermes_cli/commands_platforms.py" | head -8
+          sed -n '95,118p' "$R/hermes_cli/commands_platforms.py"
+          echo "===== S5) pairing methods detail ====="
+          sed -n '376,400p' "$R/gateway/pairing.py"
+          sed -n '456,530p' "$R/gateway/pairing.py"
+          echo "===== S6) providers: registry + fetch_models ====="
+          grep -nE 'def (list_providers|get_provider_profile)' "$R/providers/__init__.py"
+          sed -n '113,131p' "$R/providers/__init__.py"
+          grep -rn 'def fetch_models' "$R/hermes_cli/"*.py "$R/providers/"*.py 2>/dev/null | head -4
+          grep -rn 'name: str = "google"' "$R/providers/"*.py 2>/dev/null | head -4
+          echo "===== S7) auth store (auth.json) writers ====="
+          grep -nE 'def [a-z_]*(cred|auth|key)' "$R/hermes_cli/auth.py" | head -16
+          grep -n 'auth.json' "$R/hermes_cli/auth.py" | head -4
+          echo "===== S8) message handler head (intercept point) ====="
+          grep -nE 'async def (_on_message|_handle_message|_handle_text)' "$A" | head -4
+          echo "===== S9) model picker entry (from /model) ====="
+          grep -nE 'def .*model_picker|_model_picker_' "$R/gateway/slash_commands_model.py" | head -6
+          echo "===== S10) config io helpers ====="
+          grep -n 'def read_user_config_raw' "$R/hermes_cli/config.py"
+          grep -n 'def atomic_config_write\|atomic_config_write' "$R/hermes_cli/config.py" | head -3
+          grep -n 'def _gateway_config_home' "$R/gateway/run.py"
+          echo "===== CPREAD=DONE ====="
           REMOTE
