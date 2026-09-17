@@ -44,7 +44,7 @@ jobs:
           echo "=== SUITE: cpanel existing ==="
           pytest -q tests/gateway/test_cpanel.py 2>&1 | mask | tail -4
           echo "=== SUITE: cpanel t5 (persist+custom) ==="
-          pytest -q tests/gateway/test_cpanel_t5.py 2>&1 | mask | tail -4
+          pytest -q tests/gateway/test_cpanel_t5.py 2>&1 | mask | tail -60
           echo "=== SUITE: native custom-provider persistence ==="
           pytest -q tests/tui_gateway/test_custom_provider_session_persistence.py tests/hermes_cli/test_model_provider_persistence.py 2>&1 | mask | tail -4
           echo "=== SUITE: native telegram auth + fail-closed + custom-provider runtime ==="
