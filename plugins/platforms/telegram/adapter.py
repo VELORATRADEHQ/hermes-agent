@@ -2575,6 +2575,20 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("[%s] Telegram identity refresh loop iteration failed", self.name, exc_info=True)
 
+    # The visible Telegram command surface is deliberately minimal: /help + /model for normal
+    # users. This is a VISIBILITY contract only — every other command keeps working wherever
+    # it is dispatched; authorization is unchanged and enforced on the dispatch side.
+    _PUBLIC_MENU_COMMANDS = frozenset({"help", "model"})
+
+    @classmethod
+    def _filter_public_menu(cls, menu_commands, hidden_count):
+        """Restrict the registered command menu to the public surface (help, model)."""
+        visible = [pair for pair in menu_commands if pair[0].lower() in cls._PUBLIC_MENU_COMMANDS]
+        missing = cls._PUBLIC_MENU_COMMANDS - {pair[0].lower() for pair in visible}
+        if missing:
+            raise RuntimeError(f"public menu requires commands missing from registry: {sorted(missing)}")
+        return visible, hidden_count + (len(menu_commands) - len(visible))
+
     def _start_post_connect_housekeeping(self) -> None:
         """Kick off deferred post-connect housekeeping; idempotent while a task is still running."""
         task = self._post_connect_task
@@ -2594,6 +2608,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skill discovery resolves every skill path on disk; a slow filesystem after a reconnect must
         # not hold the gateway loop past the liveness watchdog (#110707). Only the Bot API call stays here.
         menu_commands, hidden_count = await asyncio.to_thread(telegram_menu_commands, max_commands=max_commands)
+        menu_commands, hidden_count = self._filter_public_menu(menu_commands, hidden_count)
         bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
         for scope_cls in (BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats):
             scope_name = getattr(scope_cls, "__name__", str(scope_cls))
@@ -2753,6 +2768,7 @@ class TelegramAdapter(BasePlatformAdapter):
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(CommandHandler("panel", self._handle_cpanel_command))
         app.add_handler(CommandHandler("start", self._handle_start_menu_command))
+        app.add_handler(CommandHandler("help", self._handle_help_command))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(
             filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION), self._handle_location_message))
@@ -4336,6 +4352,11 @@ class TelegramAdapter(BasePlatformAdapter):
         from gateway.cpanel import handle_command as _cpanel_cmd
         await _cpanel_cmd(self, update, context)
 
+    async def _handle_help_command(self, update, context):
+        """`/help` — localized, admin-aware structured page (task-7 clean surface)."""
+        from gateway.cpanel_help import handle_help_command as _cpanel_help
+        await _cpanel_help(self, update, context)
+
     async def _handle_start_menu_command(self, update, context):
         """`/start` -- welcome menu; admins get the Control Panel entry button."""
         from gateway.cpanel import handle_start_command as _cpanel_start
@@ -5908,8 +5929,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
                 from telegram import BotCommand, BotCommandScopeChat
                 from hermes_cli.commands_platforms import telegram_menu_commands, telegram_menu_max_commands
-                menu_commands, _ = await asyncio.to_thread(
+                menu_commands, _hidden_forum = await asyncio.to_thread(
                     telegram_menu_commands, max_commands=telegram_menu_max_commands())
+                menu_commands, _hidden_forum = self._filter_public_menu(menu_commands, _hidden_forum)
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)

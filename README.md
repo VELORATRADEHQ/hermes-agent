@@ -247,6 +247,52 @@ scripts/run_tests.sh
 
 ---
 
+## Operator surface (this installation)
+
+This deployment runs a customized operator layer on top of stock Hermes:
+
+- **Clean Telegram surface.** The visible Telegram command menu is intentionally
+  minimal — for normal users, exactly `/help` and `/model`. Other commands keep
+  working wherever they are dispatched; this is a visibility change only, never an
+  authorization change. `/help` renders a localized (fa/en), structured page listing
+  only the commands the calling user can actually use; admins additionally see a
+  clearly separated admin section. `/model` shows inference-capable providers and
+  models; task-only providers never appear there.
+- **Unified provider architecture.** Custom providers are described by an explicit,
+  optional declaration in `providers:` config: `auth` (`bearer` | `api_key_header`
+  | `none` | `native`), `probe` (method/path/headers/body/expected statuses),
+  `discovery` (`models` | `none` | `custom`), `runtime`
+  (`openai_chat` | `openai_responses` | `task_run` | `none`), and
+  `provider_capabilities` (`chat`, `completion`, `embeddings`, `browser_tasks`,
+  `async_runs`, `status_polling`, …). Every declaration is optional. Legacy entries
+  need no migration: without declarations they behave exactly as before
+  (Bearer + `GET {base}/models`, chat inference).
+- **Fail-fast, transactional registration.** ✅ before 💾: the Control Panel runs a
+  real probe (via `gateway/provider_probe.py`) against the configured endpoint and
+  only persists a provider once the probe contract succeeds — a failed probe saves
+  nothing, and a failed validation never persists a secret. Key rotation and base-URL
+  edits validate new values against the live endpoint before touching config.
+- **Example — task provider (Browser Use-style):**
+
+  ```yaml
+  providers:
+    browseruse:
+      api: https://api.browser-use.com/api/v4
+      name: Browser Use
+      key_env: CUSTOM_BROWSERUSE_API_KEY
+      auth: { type: api_key_header, header: X-Browser-Use-API-Key }
+      probe: { method: GET, path: /api/v3/billing/account }
+      discovery: { type: none }
+      runtime: { protocol: task_run }
+      provider_capabilities: [browser_tasks, async_runs, status_polling]
+  ```
+
+  These providers pass the probe (billing endpoint is same-origin with the v4 base),
+  show "Model discovery: Not applicable", are offered as task-only in the panel
+  (never as a chat default), and are hidden from `/model`'s inference choices.
+
+---
+
 ## Community
 
 - 💬 [Discord](https://discord.gg/NousResearch)
