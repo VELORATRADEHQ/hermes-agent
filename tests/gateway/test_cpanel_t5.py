@@ -363,8 +363,12 @@ def test_p2_providers_screen_shows_custom(env, monkeypatch):
     a._save_gateway_config_key("providers.acme.key_env", "CUSTOM_ACME_API_KEY")
     cp._env_write("CUSTOM_ACME_API_KEY", "sk-dontprint")
     text, kb = cp.screen_providers(a)
-    assert "🧩 acme" in text and "https://api.acme.example" in text
+    # task-7 compact list: collapsed rows show name+status+task-tag (+key presence).
+    # The base URL moved to the detail screen intentionally; secrecy invariant is unchanged.
+    assert "🧩 acme" in text
     assert "sk-dontprint" not in text
+    detail, _ = cp.screen_custom_detail(a, "acme")
+    assert "https://api.acme.example" in detail and "sk-dontprint" not in detail
 
 def test_p2_detail_screen_masks_key(env, monkeypatch):
     a = LoAdapter()
