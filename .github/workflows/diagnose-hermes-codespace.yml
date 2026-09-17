@@ -20,8 +20,9 @@ jobs:
           echo "===== 0) confirm branch + prior patch applied ====="
           g rev-parse --abbrev-ref HEAD
           grep -c 'hctl:' plugins/platforms/telegram/adapter.py | sed 's/^/hctl refs: /'
-          echo "===== 1) install pytest into venv (untracked dir) ====="
-          venv/bin/pip install -q pytest pytest-asyncio 2>&1 | tail -3
+          echo "===== 1) ensure pip (ensurepip) then install pytest into venv ====="
+          if [ ! -x venv/bin/pip ]; then venv/bin/python -m ensurepip --upgrade 2>&1 | tail -2; fi
+          venv/bin/python -m pip install -q pytest pytest-asyncio 2>&1 | tail -3
           venv/bin/python -m pytest --version
           echo "===== 2) pytest cpanel ====="
           venv/bin/python -m pytest tests/gateway/test_cpanel.py -q 2>&1 | tail -30
