@@ -12,15 +12,17 @@ one of the above truthfully or not render (sliver gating at render time).
 Precedence, highest wins per turn (documented and enforced at `_resolve_session_agent_runtime`):
 
 1. explicit per-session override (store row + hydrated `SessionState.conversation.model_override`)
-2. panel/global selection `model.default` (+ `model.provider`), written **only** via
-   `set_model_preference_cmd` — the same primitive `/model` CLI uses; it rolls config.yaml
-   persistence, per-session override, and `_evict_cached_agent` in one shot
+2. panel/global selection `model.default` (+ `model.provider`), persisted through
+   `cpanel._write_config_key` — the **single config-mutation path the panel uses for every key**
+   (adapter `_save_gateway_config_key`; fallback `read_user_config_raw` + `atomic_config_write`)
 3. environment default / hard fallback
 
-Cleared-state handling: `models:clearpin` clears **all four layers** (store row, hydrated
-SessionState override, legacy runner dict, cached agent). Panel screens re-render from post-write
-state, never from the value the button claimed. `/model` and the panel share the primitive, so the
-UI cannot lie about the effective model.
+Cleared-state handling: after every `models:set`, the panel clears **all four layers** of this
+chat's pin (`_clear_session_pin_and_evict`: store row, hydrated SessionState override, legacy
+runner dict, cached agent eviction). Panel screens re-render from post-write state, never from
+the value the button claimed. `/model` CLI writes its own session override through
+`SessionStore.set_model_override`; both surfaces converge on the same precedence above, which the
+per-turn resolver reads — the UI cannot assert a model the resolver would not use.
 
 - `cust:<pid> runtime.type=="task_run"` entries never enter the model precedence for chat
   (task-only — excluded from `/model` and panel defaults; refuse native set-default).
@@ -34,8 +36,8 @@ UI cannot lie about the effective model.
 | `prov:mkdefault:<name>` | **REAL+runtime** | writes `model.provider` + force-enables it natively; refusal path n/a (native chat providers only in this screen) |
 | `prov:delask/del:<name>` | REAL-access (removes from panel) | post-delete: provider deleted from native `providers:` registry/defaults; runtime re-resolves per turn |
 | `add:start/pick/keyonly/model/save/cancel` | REAL-config | wizard persists provider profile/env mapping; model picker after save routes through the same primitive |
-| `models:set:<m>` | **REAL+runtime** (after fix) | delegates to `set_model_preference_cmd` (config + persistence + session override + cache eviction), then renders returned state |
-| `models:clearpin` | **REAL+runtime** | 4-layer clear (see A), refuses silently no-op without reporting |
+| `models:set:<m>` | **REAL+runtime** (after fix) | persists `model.default` via `_write_config_key` (the canonical panel config-writer), then clears this chat's pin across 4 layers; screen re-renders from post-write state; save failure shows an explicit save-fail message and changes nothing |
+| `models:clearpin` | **REAL+runtime** | 4-layer clear (see A); failure is reported as a visible ⚠ line, never swallowed |
 | `models:type` | REAL-config | manual id → same primitive path |
 | `test:sel/go:<name>` | REAL-probe | generic protocol probe (descriptor auth/capabilities/discovery); transaction recorded; never mutates state |
 | `cust:new/sel/listf` | informational | entry creation/listing of custom providers |
