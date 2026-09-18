@@ -18,8 +18,11 @@ jobs:
           R=/home/codespace/.hermes/hermes-agent
           NEW=7fb45024fcde8b34e05c17bd238d71a8d3c311ca
           TASK5_BASE=753837183dadf3d39f3e9f2bdb7f52443deb726f
-          TIP=$(git -C "$R" rev-parse hermes-cpanel)
           git -C "$R" remote set-url origin "https://x-access-token:${TOKEN}@github.com/VELORATRADEHQ/hermes-agent.git"
+          git -C "$R" fetch origin hermes-cpanel >/dev/null 2>&1 | mask || true
+          REMOTE_TIP=$(git -C "$R" rev-parse origin/hermes-cpanel)
+          [ "$REMOTE_TIP" = "$NEW" ] || { echo "ABORT: remote tip ($REMOTE_TIP) != expected NEW ($NEW) — branch moved; pins stale"; exit 6; }
+          TIP=$(git -C "$R" rev-parse hermes-cpanel)
           if [ "$TIP" = "$NEW" ]; then
             echo "ALREADY_AT_TARGET=$NEW (idempotent rerun)"
           elif git -C "$R" merge-base --is-ancestor "$TIP" "$NEW" && git -C "$R" merge-base --is-ancestor "$TASK5_BASE" "$TIP"; then
