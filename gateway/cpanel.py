@@ -1244,16 +1244,50 @@ def _add_confirm_text(data: Dict[str, Any]) -> str:
 
 _UNAUTHORIZED = "⛔ You are not authorized to use this panel."
 
-def _is_admin(adapter, user_id: str) -> bool:
-    """Admin = configured DM admin list when present, else any pairing-approved user.
+def _admin_ids_from_config() -> Optional[frozenset]:
+    """``gateway.platforms.telegram.extra.allow_admin_from`` (DM admin list) from config.yaml.
 
-    Uses the native pairing allowlist helper; never weakens the pairing gate
-    (unauthorized users are rejected earlier by the callback auth check)."""
+    Same canonical key ``gateway.slash_access`` uses for slash-command admin gating, so the
+    Control Panel and slash commands recognize exactly the same admins. Returns ``None`` when
+    the key is absent (legacy fallback below applies); an *empty* configured list is a real
+    configuration → fail-closed (nobody is admin via this source)."""
+    try:
+        cfg = _read_config()
+        plat = (((cfg.get("gateway") or {}).get("platforms") or {}).get("telegram") or {})
+        if not isinstance(plat, dict):
+            return None
+        extra = plat.get("extra") if isinstance(plat.get("extra"), dict) else {}
+        raw = extra.get("allow_admin_from", plat.get("allow_admin_from"))  # bridged root key too
+        if raw is None:
+            return None
+        from gateway.slash_access import _coerce_id_list  # native normalizer
+        return _coerce_id_list(raw)
+    except Exception:
+        return None
+
+
+def _is_admin(adapter, user_id: str) -> bool:
+    """Admin resolution (Telegram DM), fail-closed.
+
+    Order: (1) ``allow_admin_from`` when configured — the canonical admin list shared with
+    ``gateway.slash_access``; (2) legacy fallback — the DM talk-allowlist env ids (NOTE:
+    ``_configured_allowlist`` returns ``(env_var, ids)``; the previous code compared user ids
+    against ``str()`` of the *tuple elements*, so with an env allowlist configured NOBODY was
+    ever admin — the /panel + settings + model screens all answered ⛔); (3) pairing-approved
+    users. Never weakens the pairing gate: unauthorized users are rejected earlier by the
+    callback auth check."""
+    try:
+        admin_ids = _admin_ids_from_config()
+    except Exception:
+        admin_ids = None
+    if admin_ids is not None:
+        return bool(admin_ids) and str(user_id) in admin_ids
     try:
         from gateway.pairing import _configured_allowlist, PairingStore  # native
-        allow = _configured_allowlist("telegram")
-        if allow:
-            return user_id in {str(x) for x in allow}
+        configured = _configured_allowlist("telegram")
+        if configured:
+            _env_var, ids = configured
+            return str(user_id) in {str(x) for x in ids}
         return PairingStore().is_approved("telegram", user_id)
     except Exception:
         return False

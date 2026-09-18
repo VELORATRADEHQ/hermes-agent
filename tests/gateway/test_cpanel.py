@@ -23,7 +23,11 @@ def home(tmp_path, monkeypatch):
     """Isolated HERMES home for all cpanel file IO; user "1" is the configured admin."""
     monkeypatch.setattr("gateway.run._gateway_config_home", lambda: tmp_path)
     import gateway.pairing as _gp
-    monkeypatch.setattr(_gp, "_configured_allowlist", lambda platform=None: ["1"])
+    # Mock must mirror the REAL production contract: _configured_allowlist returns
+    # (env_var, ids). Returning a bare list here previously masked the cpanel
+    # tuple-unpack regression (production _is_admin compared ids against str(tuple
+    # elements), so env-allowlist operators were never recognized as /panel admins).
+    monkeypatch.setattr(_gp, "_configured_allowlist", lambda platform=None: ("TELEGRAM_ALLOWED_USERS", ["1"]))
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     (tmp_path / "backups").mkdir(exist_ok=True)
     (tmp_path / "config.yaml").write_text("model:\n  default: gemini-3-flash-preview\n  provider: gemini\n")
