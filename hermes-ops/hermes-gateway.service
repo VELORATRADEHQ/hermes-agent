@@ -1,0 +1,34 @@
+# Hermes gateway — systemd USER unit (headless VMs). Install with hermes-ops/install-service.sh.
+# Native primitives used: gateway/systemd_notify.py (Type=notify + WATCHDOG pings while the
+# event loop progresses) + state/gateway.heartbeat (off-loop liveness witness). A frozen loop
+# stops both watchdog pings → systemd kills and restarts (no infinite loop: burst-capped).
+[Unit]
+Description=Hermes Agent gateway (Telegram adapter, polling)
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/VELORATRADEHQ/hermes-agent
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=90s
+# Secrets via env file only; never on the command line. File MUST be 0600 and readable only
+# by the service user. Missing file fails startup visibly (Extend: - prefix would hide it).
+EnvironmentFile=%h/.hermes/creds.env
+Environment=HOME=%h
+# hermes_persist supervisor health gate runs inside the gateway via native watchdog; the unit
+# below starts the gateway directly. HERMES_BIN may be overridden via override.conf.
+ExecStart=%h/harea/venv/bin/hermes gateway --accept-hooks run
+Restart=on-failure
+RestartSec=10s
+# No infinite restart loop: stop trying after 5 starts in 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+# Orderly shutdown: give the gateway its drain window, then systemd SIGKILLs.
+TimeoutStopSec=60s
+KillSignal=SIGTERM
+# Do not mask failures by looping forever around exit code 0 either; on success we likewise
+# stop (gateway is not a one-shot job; success exit means it was asked to stop).
+
+[Install]
+WantedBy=default.target

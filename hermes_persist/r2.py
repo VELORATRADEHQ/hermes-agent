@@ -24,13 +24,38 @@ class R2Error(RuntimeError):
 
 
 class R2Client:
+    """S3-compatible object client.
+
+    Provider/addressing:
+    - Backblaze B2 (endpoint host ends with ``backblazeb2.com``) → virtual-hosted style
+      ``https://<bucket>.<endpoint>/<key>``. The bucket's region is expressed by the endpoint
+      (e.g. ``s3.us-west-004.backblazeb2.com``); SigV4 region defaults to the substring after
+      ``s3.`` unless overridden with ``region=``.
+    - Cloudflare R2 and other compatibles → path style ``https://<endpoint>/<bucket>/<key>``.
+    Force with ``addressing="virtual"|"path"`` for unusual gateways/minio.
+    """
+
     def __init__(self, *, endpoint: str, bucket: str, access_key_id: str,
-                 secret_access_key: str, region: str = "auto", timeout: float = 30.0):
+                 secret_access_key: str, region: str = "auto", timeout: float = 30.0,
+                 addressing: str | None = None):
         endpoint = endpoint.rstrip("/")
         if "://" in endpoint:
-            self._base = endpoint
+            scheme, host = endpoint.split("://", 1)
         else:
-            self._base = "https://" + endpoint
+            scheme, host = "https", endpoint
+        if not scheme:
+            scheme = "https"
+        if addressing is None:
+            addressing = "virtual" if host.endswith("backblazeb2.com") else "path"
+        if region == "auto" and host.endswith("backblazeb2.com") and host.startswith("s3."):
+            region = host.split(".")[1]  # e.g. us-west-004
+        self._addressing = addressing
+        if addressing == "virtual":
+            self._base = f"{scheme}://{bucket}.{host}"
+            self._path_prefix = ""
+        else:
+            self._base = f"{scheme}://{host}"
+            self._path_prefix = f"/{bucket}"
         self.bucket = bucket
         self._ak = access_key_id
         self._sk = secret_access_key
@@ -41,7 +66,7 @@ class R2Client:
     def _request(self, method: str, key: str, payload: bytes = b"",
                  extra_headers: Optional[Dict[str, str]] = None,
                  query: Optional[List] = None) -> "tuple[int, Dict[str, str], bytes]":
-        path = f"/{self.bucket}/{key}"
+        path = f"{self._path_prefix}/{key}" if key else f"{self._path_prefix}/"
         host = self._base.split("://", 1)[1]
         headers: Dict[str, str] = {
             "Host": host,

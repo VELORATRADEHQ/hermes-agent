@@ -253,3 +253,81 @@ def healthcheck(home: Path, client: Optional[R2Client], *,
         ok = ok and c["r2_connect"] == "OK" and c["r2_current_manifest"] == "OK"
     report["ok"] = ok
     return report
+
+
+# ── encrypted secrets backup (see secrets.py for the two-layer bootstrap design) ──
+SECRETS_OBJECT_KEY = "secrets/secrets.enc"
+
+DEFAULT_SECRET_NAMES = ("TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY",
+                        "B2_APPLICATION_KEY_ID", "B2_APPLICATION_KEY",
+                        "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
+
+
+def read_secret_values(home: Path, names: Tuple[str, ...] = DEFAULT_SECRET_NAMES) -> Dict[str, str]:
+    """Collect secret values from process env, then ~/.hermes/.env / creds.env (0600).
+    Returns only PRESENT non-empty names. Never prints values."""
+    out: Dict[str, str] = {}
+    for name in names:
+        v = os.environ.get(name)
+        if v:
+            out[name] = v
+    for fname in (".env", "creds.env", "_runtime_env.sh"):
+        p = Path(home) / fname
+        if not p.is_file():
+            continue
+        try:
+            for line in p.read_text(errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k in names and v and k not in out:
+                    out[k] = v
+        except Exception:
+            continue
+    return out
+
+
+def upload_secrets(client, home: Path, master_key: bytes,
+                   names: Tuple[str, ...] = DEFAULT_SECRET_NAMES) -> Tuple[int, List[str]]:
+    """Encrypt the PRESENT secrets and store them as ONE object ``secrets/secrets.enc``.
+    Returns (payload_bytes, names_included) — names only, never values."""
+    from . import secrets as sec
+    values = read_secret_values(home, names)
+    if not values:
+        raise StateSyncError("no secret values found in env or ~/.hermes/.env/creds.env")
+    blob = sec.encrypt_secrets(values, master_key)
+    client.put_object(SECRETS_OBJECT_KEY, blob)
+    return len(blob), sorted(values.keys())
+
+
+def fetch_secrets(bootstrap_client, master_key: bytes) -> Dict[str, str]:
+    """Download + decrypt secrets.enc IN MEMORY (bootstrap read-only client).
+    Returns the name→value dict; caller decides where they may be written (0600)."""
+    from . import secrets as sec
+    blob = bootstrap_client.get_object(SECRETS_OBJECT_KEY)
+    if blob is None:
+        raise StateSyncError(f"encrypted secrets object not found: {SECRETS_OBJECT_KEY}")
+    return sec.decrypt_secrets(blob, master_key)
+
+
+def write_creds_env(home: Path, values: Dict[str, str], *,
+                    filename: str = "creds.env") -> Path:
+    """Atomically write KEY=VALUE lines with 0600. Values are never echoed by this function."""
+    home = Path(home)
+    home.mkdir(parents=True, exist_ok=True)
+    target = home / filename
+    lines = "".join(f"{k}={v}\n" for k, v in sorted(values.items()))
+    tmp = target.with_name(target.name + ".tmp")
+    old_umask = os.umask(0o177)
+    try:
+        tmp.write_text(lines)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    finally:
+        os.umask(old_umask)
+    return target

@@ -302,3 +302,7 @@ native/fts5_cjk/*.so
 creds.env
 _runtime_env.sh
 dn_keep.env
+
+# keep ops tooling tracked despite the broad hermes-*/* ignore above
+!hermes-ops/
+!hermes-ops/**
