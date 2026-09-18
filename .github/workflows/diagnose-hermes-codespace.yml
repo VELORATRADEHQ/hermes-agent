@@ -1,53 +1,85 @@
-name: cp-implementation-read
+name: cpanel-deploy8
 on:
   workflow_dispatch:
 jobs:
-  read:
+  deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 14
+    env:
+      CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
     steps:
-      - name: Implementation-surface read (read-only)
+      - name: Deploy hermes-cpanel -> codespace, test, restart gateway (value never printed)
         env:
           GH_TOKEN: ${{ secrets.CODESPACE_LIFECYCLE_PAT }}
-          NEW_CS: hermes-migrated-240m-p7ppqpw9wgg7f964v
         run: |
           set -uo pipefail
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::GH_TOKEN missing"; exit 1; }
-          gh codespace ssh --codespace "$NEW_CS" -- bash -s <<'REMOTE' 2>&1
-          R=/home/codespace/.hermes/hermes-agent
-          A="$R/plugins/platforms/telegram/adapter.py"
-          echo "===== S1) slash text routing in adapter ====="
-          grep -nE '"(/(model|status|fast|reasoning|new|help))"' "$A" | head -10
-          grep -nE 'def _.*(slash|command)' "$A" | head -8
-          echo "===== S2) callback ctx + auth + edit helpers ====="
-          grep -n 'def _callback_ctx' "$A"; sed -n "$(grep -n 'def _callback_ctx' "$A" | cut -d: -f1),+16p" "$A"
-          grep -n 'def _callback_authorized' "$A"; sed -n "$(grep -n 'def _callback_authorized' "$A" | cut -d: -f1),+14p" "$A"
-          grep -n 'def _edit_md_quiet' "$A"; sed -n "$(grep -n 'def _edit_md_quiet' "$A" | cut -d: -f1),+10p" "$A"
-          grep -n 'def _send_control_message' "$A"; sed -n "$(grep -n 'def _send_control_message' "$A" | cut -d: -f1),+18p" "$A"
-          echo "===== S3) slash command dispatch (typed) ====="
-          grep -nE 'slash_commands|GatewaySlashCommandsMixin|_handle_slash' "$R/gateway/run.py" 2>/dev/null | head -6
-          grep -rnE "('/model'|"/model")" "$R/gateway/slash_commands.py" | head -4
-          grep -nE 'def (build_|register_|_cmd_)' "$R/gateway/slash_commands.py" | head -12
-          echo "===== S4) menu builder ====="
-          grep -nE 'def (telegram_menu_commands|telegram_menu_max_commands)|_DEFAULT_TELEGRAM' "$R/hermes_cli/commands_platforms.py" | head -8
-          sed -n '95,118p' "$R/hermes_cli/commands_platforms.py"
-          echo "===== S5) pairing methods detail ====="
-          sed -n '376,400p' "$R/gateway/pairing.py"
-          sed -n '456,530p' "$R/gateway/pairing.py"
-          echo "===== S6) providers: registry + fetch_models ====="
-          grep -nE 'def (list_providers|get_provider_profile)' "$R/providers/__init__.py"
-          sed -n '113,131p' "$R/providers/__init__.py"
-          grep -rn 'def fetch_models' "$R/hermes_cli/"*.py "$R/providers/"*.py 2>/dev/null | head -4
-          grep -rn 'name: str = "google"' "$R/providers/"*.py 2>/dev/null | head -4
-          echo "===== S7) auth store (auth.json) writers ====="
-          grep -nE 'def [a-z_]*(cred|auth|key)' "$R/hermes_cli/auth.py" | head -16
-          grep -n 'auth.json' "$R/hermes_cli/auth.py" | head -4
-          echo "===== S8) message handler head (intercept point) ====="
-          grep -nE 'async def (_on_message|_handle_message|_handle_text)' "$A" | head -4
-          echo "===== S9) model picker entry (from /model) ====="
-          grep -nE 'def .*model_picker|_model_picker_' "$R/gateway/slash_commands_model.py" | head -6
-          echo "===== S10) config io helpers ====="
-          grep -n 'def read_user_config_raw' "$R/hermes_cli/config.py"
-          grep -n 'def atomic_config_write\|atomic_config_write' "$R/hermes_cli/config.py" | head -3
-          grep -n 'def _gateway_config_home' "$R/gateway/run.py"
-          echo "===== CPREAD=DONE ====="
+          gh codespace ssh --codespace "$CS" -- bash -s <<'REMOTE' 2>&1 | python3 -c '
+          import sys,re
+          d=sys.stdin.buffer.read().decode("utf-8","replace")
+          d=re.sub(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}","<tg-token>",d)
+          d=re.sub(r"(AQ\.|AIza|sk-)[A-Za-z0-9._-]{8,}","<redacted>",d)
+          d=re.sub(r"(Bearer\s+|X-Browser-Use-API-Key:\s*)[A-Za-z0-9._-]{8,}",r"\1<redacted>",d)
+          sys.stdout.write(d)'
+          set -uo pipefail
+          H="$HOME/.hermes"; R="$H/hermes-agent"
+          LOG="$H/state/hermes-gateway.log"
+          echo "===== D1) pull deploy ref ====="
+          cd "$R" || exit 1
+          git fetch origin hermes-cpanel --depth=10 2>&1 | tail -2
+          git reset --hard origin/hermes-cpanel >/dev/null 2>&1 || exit 1
+          HEAD_NEW=$(git rev-parse --short HEAD)
+          echo "deployed_head=$HEAD_NEW"
+          echo "task_runtime_present=$(test -f gateway/task_runtime.py && echo yes || echo no)"
+
+          echo "===== D2) venv dependency smoke ====="
+          . "$R/.venv/bin/activate" || { echo "::error::venv missing"; exit 1; }
+          python -c "import httpx, yaml; import gateway.task_runtime as t; print('task_runtime import OK, statuses:', len(t.ALL_STATUSES))"
+
+          echo "===== D3) focused test matrix on deployed tree ====="
+          cd "$R"
+          PYTHONPATH="$R" python -m pytest -q \
+            tests/gateway/test_task_runtime.py \
+            tests/gateway/test_cpanel_model_apply.py \
+            tests/gateway/test_cpanel_t5.py \
+            tests/gateway/test_cpanel_t7.py \
+            tests/gateway/test_provider_probe.py \
+            tests/gateway/test_model_picker_persist.py \
+            tests/gateway/test_session_model_override_persistence.py \
+            tests/gateway/test_help_surface.py 2>&1 | tail -4
+
+          echo "===== D4) locale parity invariant ====="
+          python - <<'PYEOF'
+          import glob, yaml
+          def flat(d, p=""):
+              ks=set()
+              for k,v in (d or {}).items():
+                  if isinstance(v,dict): ks|=flat(v,p+str(k)+".")
+                  else: ks.add(p+str(k))
+              return ks
+          docs={p.split("/")[-1]: yaml.safe_load(open(p,encoding="utf-8")) for p in glob.glob("locales/*.yaml")}
+          ref=flat(docs["en.yaml"])
+          bad={n:len(ref-flat(d)) for n,d in docs.items() if flat(d)!=ref}
+          print("PARITY:","OK" if not bad else bad)
+          PYEOF
+
+          echo "===== D5) restart gateway on new head ====="
+          if pgrep -f "hermes.*gateway" | grep -v $$ >/dev/null 2>&1; then
+            pkill -f "hermes.*gateway" 2>/dev/null
+            for i in $(seq 1 10); do pgrep -f "hermes.*gateway" >/dev/null 2>&1 || break; sleep 2; done
+            echo "old gateway stopped"
+          fi
+          OFF=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+          export PATH="$H/bin:$PATH"
+          cd "$HOME"
+          nohup hermes gateway --accept-hooks run >> "$LOG" 2>&1 &
+          GPID=$!
+          READY=0
+          for i in $(seq 1 24); do
+            if ! kill -0 "$GPID" 2>/dev/null; then echo "process died during boot"; break; fi
+            if tail -c +$((OFF+1)) "$LOG" 2>/dev/null | grep -qiE "Connected to Telegram|polling mode"; then READY=1; break; fi
+            sleep 5
+          done
+          [ "$READY" = "1" ] && echo "GATEWAY=STARTED pid=$GPID head=$HEAD_NEW" || { echo "GATEWAY=START_FAILED"; tail -12 "$LOG" | cut -c1-160; exit 1; }
+          echo "===== DEPLOY8=DONE ====="
           REMOTE
