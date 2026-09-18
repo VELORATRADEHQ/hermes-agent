@@ -529,6 +529,12 @@ cpanel:
   status:
     title: "\U0001f4ca System Status"
     note: "Infrastructure status is independent of AI provider health."
+  task:
+    notcapable: "This provider is not task-capable."
+    nokey: "No credential configured for this task provider."
+    ask: "Send the task instruction as a normal message now. It will run against this provider with bounded polling; no credentials are shown."
+    running: "Task is running (bounded polling)…"
+    status: "status"
   users:
     title: "\U0001f464 User Management"
     pending: "Pending requests"
