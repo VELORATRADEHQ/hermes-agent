@@ -362,9 +362,126 @@ def _profiles() -> Dict[str, Any]:
             out[name] = p
     return out
 
+# ── runtime coupling: session model pins (/model) vs global default (panel) ─────────────
+#
+# Source of truth map (see README "Operator surface"):
+#   global default  = config.yaml model.default + model.provider  (Admin Control Panel)
+#   per-session pin = gateway session store ``model_override``    (Telegram /model)
+# Precedence per turn (gateway/run_turn.py): session pin > channel override > global default.
+# The panel must (a) persist the global default, and (b) apply it to the admin's CURRENT chat
+# by clearing that chat's pin when it would shadow the new default — otherwise the panel look
+# "UI-only" for exactly the admin using it (observed regression; gateway_routing model_override).
+
+def _gateway_runner(adapter):
+    return getattr(adapter, "gateway_runner", None)
+
+
+def _current_chat_session(adapter, query=None, chat_id: Optional[str] = None,
+                          chat_type: Optional[str] = None, thread_id: Optional[Any] = None,
+                          user_id: Optional[str] = None) -> Tuple[Optional[str], Any, Any]:
+    """(session_key, session_store, runner) for the chat the callback happened in.
+
+    Best-effort: returns (None, None, None) when the gateway runner is not attached (unit tests,
+    CLI surfaces) — callers must degrade to plain config writes in that case.
+    """
+    runner = _gateway_runner(adapter)
+    if runner is None:
+        return None, None, None
+    try:
+        from gateway.session import SessionSource
+        from gateway.config import Platform
+        msg = getattr(query, "message", None) if query is not None else None
+        cid = chat_id or str(getattr(msg, "chat_id", "") or "")
+        if not cid:
+            return None, None, None
+        src_chat_type = chat_type or str(getattr(getattr(msg, "chat", None), "type", "") or "dm")
+        src = SessionSource(
+            platform=Platform.TELEGRAM, chat_id=cid,
+            chat_type=("dm" if src_chat_type in ("private", "dm") else "group"),
+            user_id=user_id or str(getattr(getattr(query, "from_user", None), "id", "") or "") or None,
+            thread_id=str(thread_id if thread_id is not None else getattr(msg, "message_thread_id", "") or "") or None,
+        )
+        normalize = getattr(runner, "_normalize_source_for_session_key", None)
+        if callable(normalize):
+            src = normalize(src)
+        key_fn = getattr(runner, "_session_key_for_source", None)
+        session_key = key_fn(src) if callable(key_fn) else None
+        store = getattr(runner, "session_store", None)
+        return session_key, store, runner
+    except Exception:
+        logger.debug("cpanel: could not resolve current chat session", exc_info=True)
+        return None, None, None
+
+
+def _session_model_pin(session_store, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Persisted /model override for *session_key* (non-secret fields only) or None."""
+    if not session_store or not session_key:
+        return None
+    try:
+        ov = session_store.get_model_override(session_key)
+        if isinstance(ov, dict) and ov.get("model"):
+            return ov
+    except Exception:
+        logger.debug("cpanel: model pin read failed", exc_info=True)
+    return None
+
+
+def _clear_session_pin_and_evict(session_store, runner, session_key: Optional[str]) -> bool:
+    """Clear the /model pin for one session at ALL layers and evict the cached AIAgent so the
+    next turn re-resolves from the global default:
+
+      1. the persisted store row (``gateway_routing.model_override``; survives restarts),
+      2. the running process's hydrated in-memory pin (``SessionState.conversation.model_override``
+         — once hydrated, the per-turn resolver prefers memory and would otherwise shadow the new
+         default for the rest of the process lifetime),
+      3. the legacy runner override dict (historical compatibility), then
+      4. the cached AIAgent (its config signature includes the model; a stale instance would
+         keep serving the old model).
+
+    Returns True only when the persisted pin was cleared (store is authoritative for restart
+    persistence). In-memory and eviction failures are logged but never mask the truth.
+    """
+    if not session_store or not session_key:
+        return False
+    try:
+        session_store.set_model_override(session_key, None)
+    except Exception:
+        logger.error("cpanel: failed to clear /model pin for session=%s", session_key, exc_info=True)
+        return False
+    if runner is not None:
+        try:
+            state = runner._peek_session_state(session_key)
+            conv = getattr(state, "conversation", None) if state is not None else None
+            if conv is not None and getattr(conv, "model_override", None) is not None:
+                conv.model_override = None
+        except Exception:
+            logger.debug("cpanel: in-memory pin clear failed (persisted pin already gone)", exc_info=True)
+        try:
+            legacy = getattr(runner, "_session_model_overrides", None)
+            if isinstance(legacy, dict):
+                legacy.pop(session_key, None)
+        except Exception:
+            logger.debug("cpanel: legacy override map cleanup failed", exc_info=True)
+        evict = getattr(runner, "_evict_cached_agent", None)
+        if callable(evict):
+            try:
+                evict(session_key)
+            except Exception:
+                logger.debug("cpanel: agent eviction failed (pin cleared anyway)", exc_info=True)
+    return True
+
 def _disabled_set(cfg: Dict[str, Any]) -> set:
-    raw = ((cfg.get("model") or {}).get("disabled_providers") or [])
-    return {str(x).lower() for x in raw if x}
+    """Providers disabled from the panel. UNION of the native runtime gate
+    (``providers.<name>.enabled: false`` — honored by hermes_cli.runtime_provider) and the
+    legacy panel-only list (``model.disabled_providers``) for backward compatibility. The panel
+    writes the native form; the legacy key is migrated out on any write."""
+    out = {str(x).lower() for x in ((cfg.get("model") or {}).get("disabled_providers") or []) if x}
+    provs = cfg.get("providers")
+    if isinstance(provs, dict):
+        for name, block in provs.items():
+            if isinstance(block, dict) and block.get("enabled") is False:
+                out.add(str(name).lower())
+    return out
 
 def _provider_rows() -> List[Dict[str, Any]]:
     cfg = _read_config()
@@ -625,7 +742,7 @@ def screen_provider_detail(adapter, name: str):
     ])
     return "\n".join(lines), kb
 
-def screen_models(adapter):
+def screen_models(adapter, pin: Optional[Dict[str, Any]] = None):
     cfg = _read_config()
     model = cfg.get("model") or {}
     active_m = str(model.get("default") or "")
@@ -633,10 +750,18 @@ def screen_models(adapter):
     candidates = _model_candidates(pname)
     lines = [ _T("cpanel.models.title", "🤖 Model Management"), "─" * 26,
               f"{_T('cpanel.models.provider', 'Provider')}: {pname or '—'}",
-              f"{_T('cpanel.models.active', 'Active model')}: {active_m or '—'}", "" ]
+              f"{_T('cpanel.models.global', 'Global default')}: {active_m or '—'}", "" ]
+    pin_model = str((pin or {}).get("model") or "")
+    if pin_model:
+        lines.append(_T("cpanel.models.pin", "📌 This chat is pinned via /model to: ") + pin_model)
+        lines.append(_T("cpanel.models.pineff", "   → overrides the global default in THIS chat only."))
+    else:
+        lines.append(_T("cpanel.models.nopin", "Effective next message in this chat: global default."))
     kb_rows = []
+    if pin_model:
+        kb_rows.append([("🧹 " + _T("cpanel.models.cleapin", "Clear this chat's /model pin"), "hctl:models:clearpin")])
     if candidates:
-        lines.append(_T("cpanel.models.pick", "Tap to set as active (saved to config; no AI call):"))
+        lines.append(_T("cpanel.models.pick", "Tap to set as global default (persisted; applied to this chat; no AI call):"))
         for m in candidates[:12]:
             mark = "✓ " if m == active_m else ""
             kb_rows.append([(f"{mark}{m}"[:60], f"hctl:models:set:{m[:40]}")])
@@ -985,6 +1110,35 @@ def _decorate(res: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── flows (add provider wizard) ───────────────────────────────────────────────
 
+async def _run_task_for_entry(entry: Dict[str, Any], instruction: str) -> Dict[str, Any]:
+    """One task-run via the task-capable runtime (gateway/task_runtime.py). The secret is resolved
+    from the environment/confit at call time inside the runtime and is NEVER in the return value."""
+    from gateway import task_runtime
+    return await task_runtime.run_task(dict(entry), instruction)
+
+
+def _format_task_result(pid: str, result: Dict[str, Any]) -> str:
+    """Truth-first task result rendering: explicit status, evidence, never secrets."""
+    status = str(result.get("status") or "?")
+    icon = {"success": "✅", "failed": "❌", "cancelled": "⏹", "timeout": "⏱",
+            "auth": "🔑", "quota": "💳", "validation": "⚠️", "provider_error": "🧯",
+            "network": "📡", "malformed": "🧩", "no_key": "🚫", "not_capable": "🚫",
+            "rejected": "🛡"}.get(status, "❓")
+    lines = [f"{icon} {pid}: {_T('cpanel.task.status', 'status')}: {status}", "─" * 26]
+    if result.get("http_status"):
+        lines.append(f"HTTP {result['http_status']}")
+    if result.get("run_id"):
+        lines.append(f"run id: {result['run_id'][:60]}")
+    if result.get("polls") is not None and status not in ("no_key", "not_capable", "rejected", "validation"):
+        lines.append(f"polls: {result.get('polls', 0)} · {result.get('elapsed_s', 0)}s")
+    if result.get("detail"):
+        lines.append(f"detail: {result['detail']}")
+    if result.get("output"):
+        lines.append("")
+        lines.append(str(result["output"]))
+    return "\n".join(lines)[:_MAX_TEXT]
+
+
 def screen_custom_detail(adapter, pid: str):
     e = _custom_providers().get(pid)
     if not e:
@@ -1024,6 +1178,8 @@ def screen_custom_detail(adapter, pid: str):
     if discovery_supported and not task_only:
         first_row.append(("📋 " + _T("cpanel.cust.models", "Models"), f"{cb}models:{pid}"))
     rows = [first_row]
+    if task_only:
+        rows.insert(1, [("▶ " + _T("cpanel.cust.runtask", "Run task"), f"{cb}runtask:{pid}")])
     if not task_only:
         rows.append([("⭐ " + _T("cpanel.prov.setdefault", "Set Default"), f"{cb}setdef:{pid}")])
     rows.append([("🔄 " + _T("cpanel.cust.toggle", "Enable/Disable"), f"{cb}toggle:{pid}")])
@@ -1250,16 +1406,34 @@ async def handle_callback(adapter, query, data: str) -> None:
             if op == "sel" and arg:
                 text, kb = screen_provider_detail(adapter, arg)
             elif op == "toggle" and arg:
-                cfg = _read_config()
-                dis = sorted(_disabled_set(cfg))
                 nm = arg.lower()
-                if arg2 == "off" and nm not in dis:
-                    dis.append(nm)
-                if arg2 == "on" and nm in dis:
-                    dis.remove(nm)
-                _write_config_key(adapter, "model.disabled_providers", dis)
+                # Native runtime gate (hermes_cli.runtime_provider._raise_if_provider_disabled);
+                # legacy panel list is migrated out. NOTE: disabling the ACTIVE provider makes
+                # turns fail visibly until a new default is chosen — warn, never silently route.
+                cfg = _read_config()
+                legacy = [str(x) for x in ((cfg.get("model") or {}).get("disabled_providers") or []) if x]
+                if nm in legacy:
+                    legacy.remove(nm)
+                    _write_config_key(adapter, "model.disabled_providers", legacy)
+                if arg2 == "off":
+                    _write_config_key(adapter, f"providers.{arg}.enabled", False)
+                else:
+                    _write_config_key(adapter, f"providers.{arg}.enabled", True)
                 text, kb = screen_provider_detail(adapter, arg)
+                active_p = str((_read_config().get("model") or {}).get("provider") or "")
+                if arg2 == "off" and active_p == arg:
+                    text = "⚠️ " + _T("cpanel.prov.offactive",
+                                      "You disabled the ACTIVE default provider — chat turns will fail until you choose another default.") + "\n\n" + text
             elif op == "mkdefault" and arg:
+                # A default provider must not be disabled: enable natively + clear legacy pin.
+                cfg = _read_config()
+                legacy = [str(x) for x in ((cfg.get("model") or {}).get("disabled_providers") or []) if x]
+                if arg.lower() in legacy:
+                    legacy.remove(arg.lower())
+                    _write_config_key(adapter, "model.disabled_providers", legacy)
+                provs = cfg.get("providers")
+                if isinstance(provs, dict) and isinstance(provs.get(arg), dict) and provs[arg].get("enabled") is False:
+                    _write_config_key(adapter, f"providers.{arg}.enabled", True)
                 ok = _write_config_key(adapter, "model.provider", arg)
                 rows, _, am = _provider_rows()
                 text = ("⭐ " + (arg if ok else "")) + "\n" + _T("cpanel.prov.mkdefault.done", "Default provider saved. Model stays: ") + am
@@ -1325,16 +1499,45 @@ async def handle_callback(adapter, query, data: str) -> None:
             else:
                 text, kb = _add_start(adapter)
         elif screen == "models":
+            session_key, session_store, runner = _current_chat_session(adapter, query, chat_id=chat_id)
+            pin = _session_model_pin(session_store, session_key)
             if op == "set" and arg:
-                _write_config_key(adapter, "model.default", arg)
-                text, kb = screen_models(adapter)
-                text = f"✅ active model = {arg}\n\n" + text
+                saved = _write_config_key(adapter, "model.default", arg)
+                applied = ""
+                if not saved:
+                    text = "⚠️ " + _T("cpanel.savefail", "Save failed — configuration was NOT changed.") + "\n\n" + screen_models(adapter, pin=pin)[0]
+                else:
+                    # Apply to THIS chat: a stale /model pin would keep shadowing the new global
+                    # default and the panel would look decorative (the reported regression).
+                    if pin and str(pin.get("model")) != arg:
+                        if _clear_session_pin_and_evict(session_store, runner, session_key):
+                            applied = "\n" + _T("cpanel.models.pinapplied",
+                                                "Applied to this chat too (old /model pin cleared). Other chats keep their own /model pin.")
+                        else:
+                            applied = "\n⚠️ " + _T("cpanel.models.pinblocked",
+                                                   "This chat has a /model pin that could not be cleared. Use the 🧹 button and re-test.")
+                    elif pin:
+                        applied = "\n" + _T("cpanel.models.pinalready", "This chat's /model pin already matches.")
+                    pin_after = _session_model_pin(session_store, session_key)
+                    text, kb = screen_models(adapter, pin=pin_after)
+                    text = f"✅ global default = {arg}" + applied + "\n\n" + text
+            elif op == "clearpin":
+                if pin:
+                    if _clear_session_pin_and_evict(session_store, runner, session_key):
+                        text = "🧹 " + _T("cpanel.models.pincleared", "Pin cleared — this chat now follows the global default.") + "\n\n"
+                        pin = None
+                    else:
+                        text = "⚠️ " + _T("cpanel.models.pinclearfail", "Could not clear the pin (session store unavailable).") + "\n\n"
+                else:
+                    text = _T("cpanel.models.nopin2", "This chat has no /model pin.") + "\n\n"
+                text2, kb = screen_models(adapter, pin=pin)
+                text = text + text2
             elif op == "type":
                 _pending_set(chat_id, "models", "type", {})
                 text = _T("cpanel.models.typeask", "Send the model id as a normal message now.")
                 kb = _back_cancel(adapter, "hctl:models")
             else:
-                text, kb = screen_models(adapter)
+                text, kb = screen_models(adapter, pin=pin)
         elif screen == "test":
             if op == "sel" and arg:
                 text, kb = screen_test(adapter, arg)
@@ -1440,6 +1643,19 @@ async def handle_callback(adapter, query, data: str) -> None:
                 _write_config_key(adapter, f"providers.{arg}.enabled", not e.get("enabled", True))
                 text, kb = screen_custom_detail(adapter, arg)
                 text = ("✅ enabled" if not e.get("enabled", True) else "⚪ disabled") + "\n\n" + text
+            elif op == "runtask" and arg:
+                e = _custom_providers().get(arg) or {}
+                if not _entry_task_only(e):
+                    text = "🚫 " + _T("cpanel.task.notcapable", "This provider is not task-capable.")
+                    kb = _back_cancel(adapter, f"hctl:cust:sel:{arg}")
+                elif not _entry_has_cred(e):
+                    text = "🚫 " + _T("cpanel.task.nokey", "No credential configured for this task provider.")
+                    kb = _back_cancel(adapter, f"hctl:cust:sel:{arg}")
+                else:
+                    _pending_set(chat_id, "task", "instruction", {"pid": arg})
+                    text = "▶ " + _T("cpanel.task.ask",
+                                      "Send the task instruction as a normal message now. It will run against this provider with bounded polling; no credentials are shown.")
+                    kb = _back_cancel(adapter, f"hctl:cust:sel:{arg}")
             elif op == "editask" and arg:
                 rows = [
                     [(_T("cpanel.cust.ebase", "✏️ Change base URL"), f"hctl:cwx:eb:{arg}")],
@@ -1712,6 +1928,48 @@ async def consume_pending_input(adapter, update, context) -> bool:
             pass
         return True
 
+    if flow == "task" and step == "instruction":
+        d = dict((p or {}).get("data") or {})
+        _pending_pop(chat_id)
+        pid = str(d.get("pid") or "")
+        e = _custom_providers().get(pid)
+        instruction = (text_in or "").strip()
+        if not e or not _entry_task_only(e):
+            try:
+                await adapter._send_control_message(chat_id, "🚫 " + _T("cpanel.task.notcapable", "This provider is not task-capable."),
+                                                    parse_mode=None, thread_id=getattr(msg, "message_thread_id", None), metadata=None,
+                                                    reply_markup=_back_cancel(adapter, "hctl:prov"))
+            except Exception:
+                pass
+            return True
+        if not instruction:
+            _pending_set(chat_id, "task", "instruction", d)
+            try:
+                await adapter._send_control_message(chat_id, _T("cpanel.task.ask", "Send the task instruction as a normal message now."),
+                                                    parse_mode=None, thread_id=getattr(msg, "message_thread_id", None), metadata=None,
+                                                    reply_markup=_back_cancel(adapter, f"hctl:cust:sel:{pid}"))
+            except Exception:
+                pass
+            return True
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        try:
+            await adapter._send_control_message(chat_id, "… " + _T("cpanel.task.running", "Task is running (bounded polling)…"),
+                                                parse_mode=None, thread_id=getattr(msg, "message_thread_id", None), metadata=None)
+        except Exception:
+            pass
+        result = await _run_task_for_entry(e, instruction)
+        body = _format_task_result(pid, result)
+        try:
+            await adapter._send_control_message(chat_id, body, parse_mode=None,
+                                                thread_id=getattr(msg, "message_thread_id", None), metadata=None,
+                                                reply_markup=_back_cancel(adapter, f"hctl:cust:sel:{pid}"))
+        except Exception:
+            pass
+        return True
+
     if flow == "models" and step == "type":
         _pending_pop(chat_id)
         model_id = re.sub(r"\s+", "", text_in)[:80]
@@ -1720,9 +1978,29 @@ async def consume_pending_input(adapter, update, context) -> bool:
         except Exception:
             pass
         ok = _write_config_key(adapter, "model.default", model_id)
-        kb_text, kb = screen_models(adapter)
+        applied = ""
+        verified_note = ""
+        if ok:
+            cfg = _read_config()
+            pname = str((cfg.get("model") or {}).get("provider") or "")
+            if model_id not in _model_candidates(pname):
+                verified_note = "\n⚠️ " + _T("cpanel.models.unverified",
+                                            "Model id not in the provider's known catalog — saved, but unverified. Run 🧪 Test.")
+            session_key, session_store, runner = _current_chat_session(
+                adapter, None, chat_id=chat_id, chat_type=str(getattr(getattr(msg, "chat", None), "type", "") or "dm"),
+                thread_id=getattr(msg, "message_thread_id", None),
+                user_id=str(getattr(getattr(msg, "from_user", None), "id", "") or ""))
+            pin = _session_model_pin(session_store, session_key)
+            if pin and str(pin.get("model")) != model_id:
+                if _clear_session_pin_and_evict(session_store, runner, session_key):
+                    applied = "\n" + _T("cpanel.models.pinapplied",
+                                        "Applied to this chat too (old /model pin cleared). Other chats keep their own /model pin.")
+                else:
+                    applied = "\n⚠️ " + _T("cpanel.models.pinblocked",
+                                           "This chat has a /model pin that could not be cleared.")
+        kb_text, kb = screen_models(adapter, pin=None)
         try:
-            await adapter._send_control_message(chat_id, ("✅ active model = " + model_id + "\n\n" if ok else "⚠️ save failed\n\n") + kb_text,
+            await adapter._send_control_message(chat_id, ("✅ global default = " + model_id + applied + verified_note + "\n\n" if ok else "⚠️ save failed\n\n") + kb_text,
                                                 parse_mode=None, thread_id=getattr(msg, "message_thread_id", None), metadata=None, reply_markup=kb)
         except Exception:
             pass
