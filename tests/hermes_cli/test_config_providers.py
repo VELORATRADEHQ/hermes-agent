@@ -74,14 +74,22 @@ def test_probe_block_normalization():
     out = _normalize_custom_provider_entry(
         _legacy_entry(probe={
             "method": "get", "path": "/api/v3/billing/account",
-            "headers": "X-Browser-Use-API-Key: ${KEY}", "body": {"ping": True},
+            "headers": {"X-Browser-Use-API-Key": "${BU_PROBE}"}, "body": {"ping": True},
             "expected_statuses": [200, "oops", -1, 401],
         })
     )
     probe = out["probe"]
     assert probe["method"] == "GET"
     assert probe["path"] == "/api/v3/billing/account"
-    assert isinstance(probe["headers"], str) and "X-Browser-Use-API-Key" in probe["headers"]
+    assert probe["headers"] == {"X-Browser-Use-API-Key": "${BU_PROBE}"}
+    # Non-dict headers are rejected at config normalization (security: no home-grown header
+    # parsing; operator convenience JSON-string parsing exists only at probe run-time).
+    probe2 = _normalize_custom_provider_entry(
+        _legacy_entry(probe={"method": "GET", "path": "/p",
+                             "headers": '{"X-Browser-Use-API-Key": "${BU_PROBE}"}',
+                             "expected_statuses": [200]})
+    )["probe"]
+    assert "headers" not in probe2
     assert probe["body"] == '{"ping": true}'
     assert probe["expected_statuses"] == [200, 401]
 
