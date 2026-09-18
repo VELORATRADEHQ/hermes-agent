@@ -28,7 +28,7 @@ import json
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -166,12 +166,15 @@ def build_provider_probe_request(entry: Dict[str, Any]) -> Tuple[str, str, Dict[
     block = _probe_block(entry)
 
     if block.get("path"):
-        # Relative path against the base ORIGIN — host-paths like /api/v3/... allowed,
-        # absolute URLs would break the origin guarantee, refuse.
+        # Host-relative path against the base ORIGIN — /api/v3/... + base .../api/v4 resolves
+        # to <scheme>://<host>/api/v3/... (api-version paths may differ on the same origin).
         path = str(block.get("path")).strip()
         if not path.startswith("/"):
             return ("GET", base_url, {}, None, "path_rejected:not_relative")
-        url = urljoin(base_url + "/", path.lstrip("/"))
+        parts = urlsplit(base_url)
+        query, _, _frag = path.partition("#")
+        rel_path, _, q = query.partition("?")
+        url = urlunsplit((parts.scheme, parts.netloc, rel_path, q, ""))
     else:
         # OpenAI-style legacy default: {base}/models.
         url = urljoin(base_url + "/", "models")
