@@ -82,7 +82,7 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("backup", "restore", "verify", "healthcheck",
                  "secrets-put", "secrets-fetch", "secrets-check",
-                 "telegram-health", "supervisor"):
+                 "telegram-health", "supervisor", "provision-b2"):
         s = sub.add_parser(name)
         s.add_argument("--home")
         s.add_argument("--env-id")
@@ -105,6 +105,14 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     home = _home(args)
     try:
+        if args.cmd == "provision-b2":
+            from . import provision_b2
+            out_dir = str(Path(home) / "state" / "provisioned")
+            meta = provision_b2.provision(
+                bucket=_env_first("B2_BUCKET", "S3_BUCKET", "R2_BUCKET") or "hermes-state",
+                out_dir=out_dir)
+            print(json.dumps(meta, indent=2))  # metadata only — never key material
+            return 0
         if args.cmd == "telegram-health":
             from . import telegram_health
             rep = telegram_health.check(home, probe=not args.no_probe)

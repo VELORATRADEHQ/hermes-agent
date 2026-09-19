@@ -47,6 +47,34 @@ actual narrowest set. The bootstrap key additionally cannot reach anything outsi
 bucket, never in git, never printed. `secrets.enc` is undecryptable without it even
 to someone holding both B2 keys.
 
+## One-command provisioning (post-signup)
+
+After the Backblaze account exists (signup is the one owner step; B2's first 10 GB
+are free and — as of 2026 — no card is required), everything else is automated:
+
+```bash
+# master app key from the console → environment only, never into files/scripts/chat
+export B2_MASTER_APPLICATION_KEY_ID=…   # from your secret store
+export B2_MASTER_APPLICATION_KEY=…
+bash hermes-ops/provision-b2.sh
+```
+
+`python -m hermes_persist provision-b2` (wrapper: `hermes-ops/provision-b2.sh`):
+`b2_authorize_account` → reuse-or-create bucket `hermes-state` (**allPrivate**) →
+`b2_create_key` ×2 (`hermes-runtime` readFiles+writeFiles+deleteFiles bucket-scoped;
+`hermes-secret-reader` readFiles + namePrefix `secrets/`) → writes three 0600 files
+under `~/.hermes/state/provisioned/` (`b2-runtime.env`, `b2-bootstrap.env`,
+`master-key.env` with a freshly generated `HERMES_MASTER_KEY`) → prints metadata only
+(region/endpoint/paths). Key material never reaches stdout/logs/git. Then:
+
+```bash
+set -a; . ~/.hermes/state/provisioned/b2-runtime.env
+      . ~/.hermes/state/provisioned/b2-bootstrap.env
+      . ~/.hermes/state/provisioned/master-key.env; set +a
+python3 -m hermes_persist backup          # first state snapshot (SHA-256 manifest)
+python3 -m hermes_persist secrets-put     # seed secrets/secrets.enc (AES-256-GCM)
+```
+
 ## Encrypted secret backup — `secrets/secrets.enc`
 
 Contains `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, `B2_APPLICATION_KEY_ID`,
