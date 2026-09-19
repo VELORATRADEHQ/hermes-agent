@@ -16,6 +16,7 @@ WatchdogSec=90s
 # by the service user. Missing file fails startup visibly (Extend: - prefix would hide it).
 EnvironmentFile=%h/.hermes/creds.env
 Environment=HOME=%h
+WorkingDirectory=%h
 # hermes_persist supervisor health gate runs inside the gateway via native watchdog; the unit
 # below starts the gateway directly. HERMES_BIN may be overridden via override.conf.
 ExecStart=%h/harea/venv/bin/hermes gateway --accept-hooks run

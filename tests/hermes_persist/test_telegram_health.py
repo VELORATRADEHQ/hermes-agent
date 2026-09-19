@@ -127,6 +127,7 @@ def test_scan_matches_synthetic_gateway_cmdline():
     assert not th._GATEWAY_CMD_RE.search(b"bash\x00some\x00hermes\x00unrelated")
 
 
+@pytest.mark.spawns_gateway_lookalike
 def test_proc_scan_finds_live_gateway_and_prefers_exec_clean_entry():
     import subprocess as sp
     fake = sp.Popen(["bash", "-c", "exec -a 'hermes gateway --accept-hooks run' sleep 3"])
@@ -141,6 +142,7 @@ def test_proc_scan_finds_live_gateway_and_prefers_exec_clean_entry():
         fake.terminate(); fake.wait()
 
 
+@pytest.mark.spawns_gateway_lookalike
 def test_tunnel_classifies_without_pidfile_via_proc_scan(tmp_path, monkeypatch):
     home = _home(tmp_path, pid=None, hb_age=5, log=GOOD_LOG)
     import subprocess as sp
