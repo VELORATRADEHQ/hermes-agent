@@ -41,6 +41,28 @@ class RunResult:
     halted_reason: str = ""
 
 
+def _open_pidfile(path):
+    """Open pidfile for atomic-ish write (0600, parent dirs ensured)."""
+    import os as _os
+    p = _os.fspath(path)
+    _os.makedirs(_os.path.dirname(p), exist_ok=True)
+    fd = _os.open(p, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+    return _os.fdopen(fd, "w")
+
+
+def _remove_own_pidfile(path, pid: int) -> None:
+    import os as _os
+    try:
+        cur = open(_os.fspath(path)).read().strip()
+    except FileNotFoundError:
+        return
+    if cur == str(pid):
+        try:
+            _os.unlink(path)
+        except OSError:
+            pass
+
+
 def _terminate(proc: subprocess.Popen, grace: float) -> None:
     with _suppress():
         proc.terminate()
@@ -67,6 +89,7 @@ def supervise(cmd: List[str], *, env: Optional[dict] = None,
               now: Callable[[], float] = time.monotonic,
               sleep: Callable[[float], None] = time.sleep,
               log: Callable[[str], None] = print,
+              pidfile: Optional["str | os.PathLike[str]"] = None,
               stop_after_restarts: Optional[int] = None) -> RunResult:
     """Blocking supervisor loop (returns when child stops being restarted).
 
@@ -82,6 +105,13 @@ def supervise(cmd: List[str], *, env: Optional[dict] = None,
         start = now()
         log(f"supervisor: start: {' '.join(cmd[:2])}…")
         proc = subprocess.Popen(cmd, env=env)
+        last_pid = proc.pid
+        if pidfile is not None:
+            try:
+                with _open_pidfile(pidfile) as fh:
+                    fh.write(f"{proc.pid}\n")
+            except OSError:
+                pass
         strikes = 0
         killed_for_health = False
         last_check = start
@@ -115,11 +145,15 @@ def supervise(cmd: List[str], *, env: Optional[dict] = None,
 
         if stop_after_restarts is not None and res.restarts >= stop_after_restarts:
             res.halted_reason = f"stopped after {res.restarts} restarts (hook)"
+            if pidfile is not None:
+                _remove_own_pidfile(pidfile, locals().get("last_pid", -1))
             break
         if len(attempts_window) > pol.restart_limit:
             res.halted_reason = (f"halted: {len(attempts_window)} restarts within "
                                  f"{pol.window_seconds:.0f}s window (cap {pol.restart_limit})")
             log("supervisor: " + res.halted_reason)
+            if pidfile is not None:
+                _remove_own_pidfile(pidfile, locals().get("last_pid", -1))
             break
         delay = min(pol.max_backoff_s, pol.base_backoff_s * (2 ** (attempt - 1))) if attempt else pol.base_backoff_s
         why = "health" if killed_for_health else f"exit {res.exits[-1] if res.exits else '?'}"

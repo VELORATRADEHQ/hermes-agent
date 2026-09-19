@@ -101,3 +101,26 @@ def test_healthy_fn_no_spare_restarts():
                   stop_after_restarts=2)
     assert res.health_restarts == 0
     assert res.restarts == 2
+
+
+def test_pidfile_written_and_removed_on_halt(tmp_path):
+    clock = FakeClock()
+    pol = Policy(restart_limit=1, window_seconds=600, base_backoff_s=0.1)
+    pidfile = tmp_path / "state" / "gw.pid"
+    seen = {}
+
+    # peek the pidfile between restarts via the log hook
+    def spy_log(msg):
+        if "start:" in msg:
+            clock.sleep(0.01)  # let Popen settle
+            try:
+                seen.setdefault("during", pidfile.read_text().strip())
+            except FileNotFoundError:
+                pass
+
+    res = supervise.supervise(_exit_cmd(1), policy=pol, now=clock.now,
+                              sleep=clock.sleep, log=spy_log,
+                              pidfile=pidfile, stop_after_restarts=2)
+    assert res.halted_reason
+    assert seen.get("during", "").isdigit()  # pidfile existed while running
+    assert not pidfile.exists()  # removed on halt

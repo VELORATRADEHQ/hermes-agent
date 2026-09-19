@@ -120,7 +120,8 @@ def main(argv=None) -> int:
                 return 2
             def _health():
                 return telegram_health.check(home)
-            res = supervise.supervise(cmd, health_fn=_health)
+            pidfile = Path(home) / "state" / "gw.pid"
+            res = supervise.supervise(cmd, health_fn=_health, pidfile=pidfile)
             print(f"supervisor HALT: {res.halted_reason} restarts={res.restarts} health_restarts={res.health_restarts}")
             return 1 if res.restarts else 0
         if args.cmd.startswith("secrets-"):

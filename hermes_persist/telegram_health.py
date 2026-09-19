@@ -85,17 +85,54 @@ def _read_base_url(home: Path) -> Optional[str]:
         return None
 
 
-def _gateway_pid(home: Path) -> Optional[int]:
+_GATEWAY_CMD_RE = re.compile(rb"hermes.*gateway.*run|gateway.*--accept-hooks.*run", re.S)
+
+
+def _scan_proc_for_gateway() -> Optional[int]:
+    """Best-effort Linux /proc scan for a running `hermes gateway ... run` process.
+    Returns None on any failure; never raises."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    me = os.getpid()
+    matches = []
+    for ent in proc.iterdir():
+        if not ent.name.isdigit():
+            continue
+        pid = int(ent.name)
+        if pid == me:
+            continue
+        try:
+            cmd = (ent / "cmdline").read_bytes()
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            continue
+        if b"hermes" in cmd and b"gateway" in cmd and b"run" in cmd and _GATEWAY_CMD_RE.search(cmd):
+            matches.append((b"\x00-c\x00" in cmd or b"-c\x00" in cmd[:4096] and cmd.split(b"\x00")[0].endswith((b"sh", b"bash", b"dash")), pid, cmd))
+    if not matches:
+        return None
+    # prefer an exec-clean gateway process over any shell wrapper (whose cmdline
+    # embeds the same words inside a -c script argument)
+    matches.sort(key=lambda m: 1 if m[0] else 0)
+    return matches[0][1]
+
+
+def _gateway_pid(home: Path) -> tuple:
+    """Returns (pid_or_None, source: pidfile|proc-scan|none)."""
     for cand in (Path(home) / "state" / "gw.pid", Path(home) / "gateway.pid"):
         if cand.is_file():
             try:
                 txt = cand.read_text().strip()
                 nums = re.findall(r"\d+", txt)
                 if nums:
-                    return int(nums[-1])
+                    return int(nums[-1]), "pidfile"
             except Exception:
                 continue
-    return None
+    pid = _scan_proc_for_gateway()
+    if pid is not None:
+        return pid, "proc-scan"
+    return None, "none"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -135,9 +172,10 @@ def check(home: Path, *, probe: bool = True, now: Optional[float] = None) -> Dic
     ev = r["evidence"]
 
     # A/B: process
-    pid = _gateway_pid(home)
+    pid, pid_src = _gateway_pid(home)
     alive = _pid_alive(pid) if pid else False
     ev["gateway_pid_alive"] = alive
+    ev["pid_source"] = pid_src
     if not alive:
         hb = home / "state" / "gateway.heartbeat"
         log = home / "state" / "hermes-gateway.log"
