@@ -896,6 +896,7 @@ def screen_settings(adapter):
              "",
              _T("cpanel.settings.note", "Only settings Hermes already supports are editable here.")]
     kb = _kb(adapter, [
+        [("☁️ " + _T("cpanel.m.pstorage", "Persistent Storage"), "hctl:pstorage")],
         [("🇬🇧 English", "hctl:settings:lang:en"), ("🇮🇷 فارسی", "hctl:settings:lang:fa")],
         [("🟢 Compression on" if not ce else "⚪ Compression off", f"hctl:settings:comp:{'off' if ce else 'on'}")],
         [("◀️ " + _T("cpanel.back", "Back"), "hctl:main")],
@@ -1405,6 +1406,105 @@ async def handle_start_command(adapter, update, context) -> None:
         logger.warning("cpanel start menu send failed: %s", scrub_text(str(exc)))
 
 
+
+# ── persistent storage: Google Drive (real OAuth; verification-gated) ─────────
+
+def _gd_cfg():
+    """Env-only inputs; secret material never rendered. Redirect defaults to the
+    loopback paste flow (user copies the FULL redirect URL back into the chat)."""
+    import os as _os
+    cid = (_os.environ.get("GOOGLE_DRIVE_CLIENT_ID") or "").strip()
+    red = (_os.environ.get("GOOGLE_DRIVE_REDIRECT_URI") or "http://127.0.0.1").strip()
+    sec = _os.environ.get("GOOGLE_DRIVE_CLIENT_SECRET", "")  # optional (PKCE works without)
+    return cid, red, sec
+
+
+def _gd_state_line(state: str) -> str:
+    mapping = {
+        "NOT_CONNECTED": "⚪ NOT_CONNECTED", "CONNECTING": "🟡 CONNECTING",
+        "CONNECTED": "🟢 CONNECTED", "ERROR": "🔴 ERROR",
+        "REAUTH_REQUIRED": "🟠 REAUTH_REQUIRED", "DISCONNECTED": "⚫ DISCONNECTED",
+    }
+    return mapping.get(state, state)
+
+
+def screen_pstorage(adapter):
+    from hermes_persist import oauth_store, gdrive
+    home = _home()
+    st = oauth_store.status(home)
+    state = str(st.get("state") or gdrive.NOT_CONNECTED)
+    cid, _, _ = _gd_cfg()
+    last_sync = st.get("last_success_sync") or _T("cpanel.pst.never", "never")
+    last_err = st.get("error") or "—"
+    lines = [
+        _T("cpanel.pst.title", "☁️ Persistent Storage — Google Drive"), "─" * 26,
+        f"{_T('cpanel.pst.status', 'Status')}: {_gd_state_line(state)}",
+        f"{_T('cpanel.pst.lastsync', 'Last sync')}: {last_sync}",
+        f"{_T('cpanel.pst.lastbackup', 'Last backup')}: {st.get('last_backup') or _T('cpanel.pst.never', 'never')}",
+        f"{_T('cpanel.pst.account', 'Account')}: {st.get('account') or '—'}",
+        f"{_T('cpanel.pst.lastverif', 'Last verified sync')}: {st.get('last_success_sync') or _T('cpanel.pst.unchecked', 'unchecked')}",
+        "",
+        _T("cpanel.pst.note",
+           "Data lives in the hidden appDataFolder of YOUR Drive (never public, minimum scope drive.appdata). "
+           "Secrets stay AES-256-GCM encrypted there — never plaintext creds."),
+    ]
+    if state == gdrive.ERROR:
+        lines.append(f"{_T('cpanel.pst.err', 'Error')}: {scrub_text(str(last_err))[:300]}")
+    if state == gdrive.REAUTH_REQUIRED:
+        lines.append(_T("cpanel.pst.reauth", "Credential was revoked — reconnect is required (Hermes never creates another account silently)."))
+    rows = []
+    if state in (gdrive.NOT_CONNECTED, gdrive.DISCONNECTED, gdrive.REAUTH_REQUIRED, gdrive.ERROR):
+        label = ("🔒 " + _T("cpanel.pst.reconnect", "Reconnect Google Drive")) if state == gdrive.REAUTH_REQUIRED             else ("🔗 " + _T("cpanel.pst.connect", "Connect Google Drive"))
+        rows = [[(label, "hctl:pstorage:connect")]] if cid else []
+        if not cid:
+            lines.append("")
+            lines.append(_T("cpanel.pst.blocked", "BLOCKED — GOOGLE OAUTH CONFIGURATION REQUIRED (set GOOGLE_DRIVE_CLIENT_ID; optional GOOGLE_DRIVE_CLIENT_SECRET)."))
+    if state == gdrive.CONNECTED:
+        rows = [
+            [("🔁 " + _T("cpanel.pst.syncnow", "Sync Now (health+verify)"), "hctl:pstorage:syncnow")],
+            [("💾 " + _T("cpanel.pst.backupnow", "Backup Now"), "hctl:pstorage:backupnow")],
+            [("♻️ " + _T("cpanel.pst.restore", "Restore Latest (isolated dir, safe)"), "hctl:pstorage:restore")],
+            [("⛔ " + _T("cpanel.pst.disconnect", "Disconnect"), "hctl:pstorage:disconnect")],
+        ]
+    rows.append([("◀️ " + _T("cpanel.back", "Back"), "hctl:settings")])
+    return "\n".join(lines)[:_MAX_TEXT], _kb(adapter, rows)
+
+
+def _gd_finish_code(adapter, chat_id: str, raw: str) -> str:
+    """Consume the pasted redirect-URL / code → real exchange → verify → CONNECTED only on success."""
+    import urllib.parse as _up
+    from hermes_persist import oauth_store
+    home = _home()
+    cid, red, sec = _gd_cfg()
+    text_in = (raw or "").strip()
+    code, returned_state = text_in, None
+    if "://" in text_in or "code=" in text_in:
+        try:
+            qs = _up.parse_qs(_up.urlsplit(text_in if "://" in text_in else "?" + text_in).query)
+            if qs.get("code"):
+                code = qs["code"][0]
+                returned_state = (qs.get("state") or [None])[0]
+        except Exception:
+            pass
+    if not returned_state:
+        try:  # bare-code paste flow: bind to the state of the stored pending flow
+            import json as _json
+            _pending = _json.loads((home / oauth_store._PENDING_FILE).read_text())
+            returned_state = _pending.get("state")
+        except Exception:
+            returned_state = None
+    try:
+        out = oauth_store.finish_connect(home, code=code, returned_state=returned_state,
+                                         client_id=cid, client_secret=sec)
+    except Exception as exc:
+        from hermes_persist import gdrive as _gd
+        st = oauth_store.status(home)
+        return (_T("cpanel.pst.connectfail", "❌ Connect failed — status: ") + _gd_state_line(str(st.get("state") or _gd.ERROR)) +
+                "\n" + _T("cpanel.pst.reason", "Reason") + ": " + scrub_text(str(exc))[:300])
+    acct = out.get("account") or "—"
+    return _T("cpanel.pst.connected", "✅ Google Drive CONNECTED — verified (health→upload→download→checksum→cleanup). Account: ") + acct
+
+
 async def handle_callback(adapter, query, data: str) -> None:
     cb = adapter._callback_ctx(query)
     if not await adapter._callback_authorized(query, cb, _UNAUTHORIZED):
@@ -1854,6 +1954,95 @@ async def handle_callback(adapter, query, data: str) -> None:
                 text = ("✅ saved\n\n" if ok else "⚠️ save failed\n\n") + text
             else:
                 text, kb = screen_settings(adapter)
+        elif screen == "pstorage":
+            from hermes_persist import oauth_store, gdrive
+            home = _home()
+            cid, red, sec = _gd_cfg()
+            if op == "connect":
+                if not cid:
+                    text = _T("cpanel.pst.blocked", "BLOCKED — GOOGLE OAUTH CONFIGURATION REQUIRED (set GOOGLE_DRIVE_CLIENT_ID).")
+                    text2, kb = screen_pstorage(adapter)
+                    text, kb = text + "\n\n" + text2, kb
+                else:
+                    try:
+                        out = oauth_store.begin_connect(home, client_id=cid, redirect_uri=red)
+                        auth_url = out["auth_url"]
+                        _pending_set(str(cb.get("chat_id") or ""), "gdrive", "await_code", {})
+                        text2, kb = screen_pstorage(adapter)
+                        kb2 = _kb(adapter, [[("◀️ " + _T("cpanel.back", "Back"), "hctl:pstorage:cancelflow")]])
+                        try:
+                            sender = getattr(adapter, "_send_control_message", None)
+                            if callable(sender):
+                                await sender(str(cb.get("chat_id") or ""),
+                                             "🔗 " + _T("cpanel.pst.openurl", "Open this link, authorize Hermes (Drive hidden app-data folder only),\nthen paste the FULL redirect URL (or bare code) here:") + "\n\n" + auth_url,
+                                             parse_mode=None, thread_id=None, metadata=None, reply_markup=kb2)
+                        except Exception:
+                            pass
+                        text = _T("cpanel.pst.authurlsent", "🔗 Authorization link sent — paste the redirected URL here once Google shows it.") + "\n\n" + text2
+                    except Exception as exc:
+                        text2, kb = screen_pstorage(adapter)
+                        text = ("⚠️ " + scrub_text(str(exc))[:300] + "\n\n") + text2
+            elif op == "cancelflow":
+                try:
+                    _pending_pop(str(cb.get("chat_id") or ""))
+                    (home / oauth_store._PENDING_FILE).unlink(missing_ok=True)
+                    oauth_store.set_state(home, gdrive.NOT_CONNECTED)
+                except Exception:
+                    pass
+                text, kb = screen_pstorage(adapter)
+            elif op == "syncnow":
+                try:
+                    out = oauth_store.health_or_reauth(home)
+                    text2, kb = screen_pstorage(adapter)
+                    ok = out.get("state") == gdrive.CONNECTED
+                    text = ("✅ " if ok else "⚠️ ") + _T("cpanel.pst.syncout", "Sync check: ") + str(out.get("state")) + "\n\n" + text2
+                except Exception as exc:
+                    text2, kb = screen_pstorage(adapter)
+                    text = ("🔴 " + _T("cpanel.pst.syncfail", "Sync check failed: ") + scrub_text(str(exc))[:200] + "\n\n") + text2
+            elif op == "backupnow":
+                try:
+                    p_st = oauth_store.status(home).get("state")
+                    if p_st != gdrive.CONNECTED:
+                        raise RuntimeError("not connected")
+                    from hermes_persist import sync as _sync
+                    import socket as _sock, os as _os
+                    prov = oauth_store.load_provider(home, client_secret=sec)
+                    sid = _sync.backup(home, prov, env_id=_os.environ.get("HERMES_ENV_ID") or _sock.gethostname(),
+                                       hermes_version=_os.environ.get("HERMES_VERSION", "unknown"),
+                                       commit=_os.environ.get("HERMES_COMMIT", "unknown"))
+                    oauth_store.set_state(home, gdrive.CONNECTED, last_backup=sid)
+                    text2, kb = screen_pstorage(adapter)
+                    text = ("✅ " + _T("cpanel.pst.backupdone", "Backup complete, snapshot: ") + sid + "\n\n") + text2
+                except Exception as exc:
+                    text2, kb = screen_pstorage(adapter)
+                    text = ("🔴 " + _T("cpanel.pst.backupfail", "Backup failed: ") + scrub_text(str(exc))[:250] + "\n\n") + text2
+            elif op == "restore":
+                try:
+                    p_st = oauth_store.status(home).get("state")
+                    if p_st != gdrive.CONNECTED:
+                        raise RuntimeError("not connected")
+                    from hermes_persist import sync as _sync
+                    import socket as _sock, os as _os, time as _tm
+                    prov = oauth_store.load_provider(home, client_secret=sec)
+                    ok, problems, sid = _sync.verify_snapshot(prov, None)
+                    if not ok:
+                        raise RuntimeError("snapshot verify failed: " + "; ".join(problems)[:200])
+                    target = home / "state" / ("restore-check-" + str(int(_tm.time())))  # isolated: never touches live state
+                    sid2, restored = _sync.restore(target, prov, env_id=_os.environ.get("HERMES_ENV_ID") or _sock.gethostname(),
+                                                   sid=sid, force=True)
+                    names = (", ".join(restored[:6]) + ("…" if len(restored) > 6 else ""))
+                    text2, kb = screen_pstorage(adapter)
+                    text = (f"✅ " + _T("cpanel.pst.restoredone", "Verified restore of latest snapshot into isolated dir:") +
+                            f"\n{target}  ({len(restored)} files: {names})\n\n") + text2
+                except Exception as exc:
+                    text2, kb = screen_pstorage(adapter)
+                    text = ("🔴 " + _T("cpanel.pst.restorefail", "Restore failed: ") + scrub_text(str(exc))[:250] + "\n\n") + text2
+            elif op == "disconnect":
+                out = oauth_store.disconnect(home)
+                text2, kb = screen_pstorage(adapter)
+                text = ("✅ " + _T("cpanel.pst.disconnected", "Disconnected — credential revoked server-side and local token removed.") + "\n\n") + text2
+            else:
+                text, kb = screen_pstorage(adapter)
         elif screen == "logs":
             text, kb = screen_logs(adapter)
         elif screen == "backup":
@@ -1931,6 +2120,23 @@ async def consume_pending_input(adapter, update, context) -> bool:
         return False
     text_in = msg.text.strip()
     flow, step, data = p["flow"], p["step"], p["data"]
+
+    if flow == "gdrive" and step == "await_code":
+        try:
+            await msg.delete()  # may carry an OAuth code — do not leave it in chat history
+        except Exception:
+            pass
+        _pending_pop(chat_id)
+        out = _gd_finish_code(adapter, chat_id, text_in)
+        try:
+            await adapter._send_control_message(chat_id, out, parse_mode=None,
+                                                thread_id=getattr(msg, "message_thread_id", None), metadata=None)
+        except Exception:
+            try:
+                await msg.reply_text(out)
+            except Exception:
+                pass
+        return True
 
     if flow == "add" and step in ("key", "keyonly"):
         try:

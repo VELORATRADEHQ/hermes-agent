@@ -30,9 +30,37 @@ def _env_first(*names: str) -> str:
     return ""
 
 
+def _gdrive_backend_selected(args=None) -> bool:
+    """Google Drive backend selection:
+    PERSIST_BACKEND=gdrive forces it; =s3 forces S3/B2/R2; auto ⇒ Drive when a
+    connected token file exists or GOOGLE_DRIVE_CLIENT_ID is set. Home is used to
+    locate the OAuth token; falls back to ~/.hermes when args lacks --home."""
+    import os as _os
+    from pathlib import Path as _P
+    sel = (_os.environ.get("PERSIST_BACKEND") or "auto").strip().lower()
+    if sel == "s3":
+        return False
+    if sel in ("gdrive", "drive", "google"):
+        return True
+    home = _P(getattr(args, "home", None) or _os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
+    return (home / "state" / "gdrive_token.env").is_file() or bool(_os.environ.get("GOOGLE_DRIVE_CLIENT_ID"))
+
+
+def _gd_client(args):
+    """Real Google Drive provider bound to the stored, verified OAuth credential."""
+    from . import oauth_store
+    home = Path(getattr(args, "home", None) or os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
+    prov = oauth_store.load_provider(home)
+    prov.health_check()  # fail fast at startup, not mid-backup
+    return prov
+
+
 def _client(args) -> R2Client:
-    """Backend is configurable: Backblaze B2 (B2_*), generic S3 (S3_*) or Cloudflare R2 (R2_*).
+    """Backend is configurable: Google Drive (PERSIST_BACKEND=gdrive / auto), or
+    Backblaze B2 (B2_*), generic S3 (S3_*) or Cloudflare R2 (R2_*).
     Names only — values are never printed or logged."""
+    if _gdrive_backend_selected(args):
+        return _gd_client(args)
     endpoint = _env_first("B2_ENDPOINT", "S3_ENDPOINT", "R2_ENDPOINT")
     bucket = _env_first("B2_BUCKET", "S3_BUCKET", "R2_BUCKET")
     ak = _env_first("B2_APPLICATION_KEY_ID", "S3_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID")

@@ -260,7 +260,12 @@ SECRETS_OBJECT_KEY = "secrets/secrets.enc"
 
 DEFAULT_SECRET_NAMES = ("TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY",
                         "B2_APPLICATION_KEY_ID", "B2_APPLICATION_KEY",
-                        "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
+                        "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+                        # Google Drive OAuth material — mirrored ONLY inside the
+                        # AES-256-GCM secrets.enc payload (never plaintext on Drive);
+                        # SECRETS_MASTER_KEY is NEVER among mirrored names.
+                        "GOOGLE_DRIVE_CLIENT_ID", "GDRIVE_REFRESH_TOKEN",
+                        "GDRIVE_CLIENT_ID")
 
 
 def read_secret_values(home: Path, names: Tuple[str, ...] = DEFAULT_SECRET_NAMES) -> Dict[str, str]:
@@ -271,7 +276,10 @@ def read_secret_values(home: Path, names: Tuple[str, ...] = DEFAULT_SECRET_NAMES
         v = os.environ.get(name)
         if v:
             out[name] = v
-    for fname in (".env", "creds.env", "_runtime_env.sh"):
+    # state/gdrive_token.env (0600) added so the Drive OAuth credential is included
+    # in the encrypted mirror — restores on a clean machine WITHOUT re-OAuth, while
+    # never leaving the runtime as plaintext (object is AES-256-GCM sealed).
+    for fname in (".env", "creds.env", "_runtime_env.sh", "state/gdrive_token.env"):
         p = Path(home) / fname
         if not p.is_file():
             continue
